@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+  mariadb:
+    image: mariadb:latest
+    ports:
+      - "3306:3306"
+    environment:
+      MARIADB_DATABASE: auth
+      MARIADB_USER: root
+      MARIADB_PASSWORD: ""
+      MARIADB_ROOT_PASSWORD: ""
+      MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: "yes"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  auth-service:
+    build: .
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mariadb://mariadb:3306/auth
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: ""
+      SPRING_PROFILES_ACTIVE: docker
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  mariadb_data:
