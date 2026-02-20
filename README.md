@@ -22,6 +22,20 @@ Expected URLs:
 - Swagger UI: `http://localhost:8080/swagger-ui.html`
 - Actuator Health: `http://localhost:8080/actuator/health`
 
+## Environment Variables
+- `AUTH_DB_HOST` (default: `localhost`)
+- `AUTH_DB_PORT` (default: `3306`)
+- `AUTH_DB_NAME` (default: `auth`)
+- `AUTH_DB_USER` (default: `root`)
+- `AUTH_DB_PASSWORD` (default: empty)
+- `AUTHPORT` (default: `8080`)
+
+## IntelliJ Run Configuration
+Example `Environment variables`:
+`AUTH_DB_HOST=localhost;AUTH_DB_PORT=3306;AUTH_DB_NAME=auth;AUTH_DB_USER=root;AUTH_DB_PASSWORD=;AUTHPORT=8080`
+
+Hinweis: `Include system environment variables` kann aktiviert bleiben, da die Variablen service-spezifisch sind.
+
 Troubleshooting:
 - DB connection fails:
   - Ensure `mariadb` container is healthy (`docker compose ps`).

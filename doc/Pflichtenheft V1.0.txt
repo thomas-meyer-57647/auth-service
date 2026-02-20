@@ -589,3 +589,17 @@ Dead-letter nach Max-Versuchen.
   "subject_type": "USER"
 }
 
+16. Laufzeitkonfiguration (ENV)
+Folgende service-spezifische Environment-Variablen sind für die DB-/Server-Konfiguration vorgesehen:
+AUTH_DB_HOST (Default: localhost)
+AUTH_DB_PORT (Default: 3306)
+AUTH_DB_NAME (Default: auth)
+AUTH_DB_USER (Default: root)
+AUTH_DB_PASSWORD (Default: leer)
+AUTHPORT (Default: 8080)
+
+16.1 IntelliJ Run Configuration
+Beispiel für "Environment variables":
+AUTH_DB_HOST=localhost;AUTH_DB_PORT=3306;AUTH_DB_NAME=auth;AUTH_DB_USER=root;AUTH_DB_PASSWORD=;AUTHPORT=8080
+
+Hinweis: "Include system environment variables" kann aktiviert bleiben, da die Variablen service-spezifisch sind.
