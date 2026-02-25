@@ -22,15 +22,18 @@ public class JwtTokenService {
     private final JwtKeyService jwtKeyService;
     private final String issuer;
     private final Duration accessTokenTtl;
+    private final Duration serviceTokenTtl;
 
     public JwtTokenService(
             JwtKeyService jwtKeyService,
             @Value("${auth.jwt.issuer:http://localhost:8080/api/v1/auth}") String issuer,
-            @Value("${auth.jwt.access-token-ttl:PT15M}") Duration accessTokenTtl
+            @Value("${auth.jwt.access-token-ttl:PT15M}") Duration accessTokenTtl,
+            @Value("${auth.jwt.service-token-ttl:PT5M}") Duration serviceTokenTtl
     ) {
         this.jwtKeyService = jwtKeyService;
         this.issuer = issuer;
         this.accessTokenTtl = accessTokenTtl;
+        this.serviceTokenTtl = serviceTokenTtl;
     }
 
     public String issueAccessToken(
@@ -56,7 +59,7 @@ public class JwtTokenService {
                 .claim("tenant_id", tenantId)
                 .claim("scp", scopes)
                 .claim("auth_time", Date.from(now))
-                .claim("subject_type", "user");
+                .claim("subject_type", "USER");
 
         if (sid != null && !sid.isBlank()) {
             claimsBuilder.claim("sid", sid);
@@ -65,23 +68,41 @@ public class JwtTokenService {
             claimsBuilder.claim("amr", amrList);
         }
 
-        SignedJWT signedJWT = new SignedJWT(
-                new JWSHeader.Builder(JWSAlgorithm.RS256)
-                        .keyID(jwtKeyService.getKeyId())
-                        .build(),
-                claimsBuilder.build()
-        );
-
-        try {
-            signedJWT.sign(new RSASSASigner(jwtKeyService.getPrivateKey()));
-            return signedJWT.serialize();
-        } catch (JOSEException e) {
-            throw new IllegalStateException("Failed to sign access token", e);
-        }
+        return sign(claimsBuilder.build());
     }
 
     private void validateRequired(Long userId, String tenantId, List<String> audList, List<String> scopes) {
         Objects.requireNonNull(userId, "userId must not be null");
+        validateTenantAndLists(tenantId, audList, scopes);
+    }
+
+    public String issueServiceToken(String serviceName, String tenantId, List<String> audList, List<String> scopes) {
+        validateNonBlank(serviceName, "serviceName");
+        validateTenantAndLists(tenantId, audList, scopes);
+
+        Instant now = Instant.now();
+        Instant expiresAt = now.plus(serviceTokenTtl);
+
+        JWTClaimsSet claims = new JWTClaimsSet.Builder()
+                .issuer(issuer)
+                .subject(serviceName)
+                .audience(audList)
+                .issueTime(Date.from(now))
+                .expirationTime(Date.from(expiresAt))
+                .jwtID(UUID.randomUUID().toString())
+                .claim("tenant_id", tenantId)
+                .claim("scp", scopes)
+                .claim("subject_type", "SERVICE")
+                .build();
+
+        return sign(claims);
+    }
+
+    public long getServiceTokenTtlSeconds() {
+        return serviceTokenTtl.getSeconds();
+    }
+
+    private void validateTenantAndLists(String tenantId, List<String> audList, List<String> scopes) {
         Objects.requireNonNull(tenantId, "tenantId must not be null");
         if (tenantId.isBlank()) {
             throw new IllegalArgumentException("tenantId must not be blank");
@@ -95,6 +116,29 @@ public class JwtTokenService {
         Objects.requireNonNull(scopes, "scopes must not be null");
         if (scopes.isEmpty()) {
             throw new IllegalArgumentException("scopes must not be empty");
+        }
+    }
+
+    private void validateNonBlank(String value, String fieldName) {
+        Objects.requireNonNull(value, fieldName + " must not be null");
+        if (value.isBlank()) {
+            throw new IllegalArgumentException(fieldName + " must not be blank");
+        }
+    }
+
+    private String sign(JWTClaimsSet claims) {
+        SignedJWT signedJWT = new SignedJWT(
+                new JWSHeader.Builder(JWSAlgorithm.RS256)
+                        .keyID(jwtKeyService.getKeyId())
+                        .build(),
+                claims
+        );
+
+        try {
+            signedJWT.sign(new RSASSASigner(jwtKeyService.getPrivateKey()));
+            return signedJWT.serialize();
+        } catch (JOSEException e) {
+            throw new IllegalStateException("Failed to sign token", e);
         }
     }
 }

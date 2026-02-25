@@ -2,7 +2,10 @@ package de.innologic.auth;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.SignedJWT;
 import de.innologic.auth.domain.entity.Credential;
+import de.innologic.auth.security.jwt.JwtTokenService;
 import de.innologic.auth.domain.entity.Mfa;
 import de.innologic.auth.domain.entity.PasswordResetToken;
 import de.innologic.auth.domain.enums.RecoveryChannel;
@@ -52,12 +55,17 @@ class AuthApiIntegrationTest {
 
     private static final String BASE = "";
     private static final BCryptPasswordEncoder ENCODER = new BCryptPasswordEncoder();
+    private static final String INTERNAL_API_KEY_HEADER = "X-Internal-Api-Key";
+    private static final String INTERNAL_API_KEY_VALUE = "internal-test-key";
 
     @Autowired
     private MockMvc mockMvc;
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @Autowired
+    private JwtTokenService jwtTokenService;
 
     @Autowired
     private CredentialRepository credentialRepository;
@@ -114,6 +122,19 @@ class AuthApiIntegrationTest {
                 .andExpect(jsonPath("$.accessToken").exists())
                 .andExpect(jsonPath("$.tokenType").value("Bearer"))
                 .andReturn();
+
+        String accessToken = json(mfaResult).get("accessToken").asText();
+        SignedJWT accessJwt = SignedJWT.parse(accessToken);
+        JWTClaimsSet accessClaims = accessJwt.getJWTClaimsSet();
+        assertThat(accessClaims.getStringClaim("subject_type")).isEqualTo("USER");
+        assertThat(accessClaims.getStringListClaim("scp")).contains("openid", "profile");
+        assertThat(accessClaims.getStringClaim("tenant_id")).isNotBlank();
+        assertThat(accessClaims.getAudience()).contains("auth-api");
+        assertThat(accessClaims.getIssuer()).isNotBlank();
+        assertThat(accessClaims.getSubject()).isNotBlank();
+        assertThat(accessClaims.getJWTID()).isNotBlank();
+        assertThat(accessClaims.getIssueTime()).isNotNull();
+        assertThat(accessClaims.getExpirationTime()).isNotNull();
 
         String refreshCookie = extractCookieValue(mfaResult.getResponse().getHeader(HttpHeaders.SET_COOKIE), "AUTH_REFRESH");
         assertThat(refreshCookie).isNotBlank();
@@ -265,6 +286,53 @@ class AuthApiIntegrationTest {
                         .content("{\"email\":\"idem@example.com\",\"password\":\"Different123!\"}"))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("IDEMPOTENCY_CONFLICT"));
+    }
+
+    @Test
+    void internalServiceToken_withValidApiKey_returnsServiceToken() throws Exception {
+        long ttl = jwtTokenService.getServiceTokenTtlSeconds();
+        String payload = "{\"serviceName\":\"auth-service\",\"tenantId\":\"tenant-1\",\"aud\":[\"company-service\"],\"scopes\":[\"company:create\"]}";
+
+        MvcResult result = mockMvc.perform(post(BASE + "/internal/service-token")
+                        .header(INTERNAL_API_KEY_HEADER, INTERNAL_API_KEY_VALUE)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.accessToken").exists())
+                .andExpect(jsonPath("$.tokenType").value("Bearer"))
+                .andExpect(jsonPath("$.expiresIn").value((int) ttl))
+                .andReturn();
+
+        SignedJWT jwt = SignedJWT.parse(json(result).get("accessToken").asText());
+        JWTClaimsSet claims = jwt.getJWTClaimsSet();
+        assertThat(claims.getStringClaim("subject_type")).isEqualTo("SERVICE");
+        assertThat(claims.getSubject()).isEqualTo("auth-service");
+        assertThat(claims.getStringClaim("tenant_id")).isEqualTo("tenant-1");
+        assertThat(claims.getAudience()).contains("company-service");
+        assertThat(claims.getStringListClaim("scp")).contains("company:create");
+    }
+
+    @Test
+    void internalServiceToken_missingApiKey_returns401() throws Exception {
+        String payload = "{\"serviceName\":\"auth-service\",\"tenantId\":\"tenant-1\",\"aud\":[\"company-service\"],\"scopes\":[\"company:create\"]}";
+
+        mockMvc.perform(post(BASE + "/internal/service-token")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.code").value("INTERNAL_API_KEY_INVALID"));
+    }
+
+    @Test
+    void internalServiceToken_emptyScopes_returns400() throws Exception {
+        String payload = "{\"serviceName\":\"auth-service\",\"tenantId\":\"tenant-1\",\"aud\":[\"company-service\"],\"scopes\":[]}";
+
+        mockMvc.perform(post(BASE + "/internal/service-token")
+                        .header(INTERNAL_API_KEY_HEADER, INTERNAL_API_KEY_VALUE)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("VALIDATION_ERROR"));
     }
 
     private Credential createCredential(String email, String password) {

@@ -6,6 +6,7 @@ import io.swagger.v3.oas.annotations.media.Schema;
 public enum ErrorCode {
     VALIDATION_ERROR,
     INVALID_CREDENTIALS,
+    INTERNAL_API_KEY_INVALID,
     USER_LOCKED,
     USER_DISABLED,
     MFA_REQUIRED,

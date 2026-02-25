@@ -24,6 +24,7 @@ import de.innologic.auth.web.dto.MfaRecoveryStartRequestDto;
 import de.innologic.auth.web.dto.MfaVerifyRequestDto;
 import de.innologic.auth.web.dto.PasswordForgotRequestDto;
 import de.innologic.auth.web.dto.PasswordResetRequestDto;
+import de.innologic.auth.web.dto.ServiceTokenRequestDto;
 import de.innologic.auth.web.error.ApiErrorDto;
 import de.innologic.auth.web.error.AppException;
 import de.innologic.auth.web.error.ErrorCode;
@@ -85,6 +86,7 @@ public class AuthController {
     private static final String REFRESH_COOKIE_NAME = "AUTH_REFRESH";
     private static final Duration LOGIN_TRANSACTION_TTL = Duration.ofMinutes(5);
     private static final Duration IDEMPOTENCY_TTL = Duration.ofHours(24);
+    private static final String INTERNAL_API_KEY_HEADER = "X-Internal-Api-Key";
 
     private final CredentialRepository credentialRepository;
     private final MfaRepository mfaRepository;
@@ -101,6 +103,7 @@ public class AuthController {
     private final List<String> defaultAudiences;
     private final List<String> defaultScopes;
     private final Duration accessTokenTtl;
+    private final String internalApiKey;
 
     public AuthController(
             CredentialRepository credentialRepository,
@@ -114,7 +117,8 @@ public class AuthController {
             @Value("${auth.default-tenant-id:default}") String defaultTenantId,
             @Value("${auth.default-audience:auth-api}") String defaultAudience,
             @Value("${auth.default-scopes:openid,profile}") String defaultScopes,
-            @Value("${auth.jwt.access-token-ttl:PT15M}") Duration accessTokenTtl
+            @Value("${auth.jwt.access-token-ttl:PT15M}") Duration accessTokenTtl,
+            @Value("${auth.internal.api-key:}") String internalApiKey
     ) {
         this.credentialRepository = credentialRepository;
         this.mfaRepository = mfaRepository;
@@ -128,6 +132,7 @@ public class AuthController {
         this.defaultAudiences = splitCsv(defaultAudience);
         this.defaultScopes = splitCsv(defaultScopes);
         this.accessTokenTtl = accessTokenTtl;
+        this.internalApiKey = internalApiKey;
     }
 
     @PostMapping("/login")
@@ -362,6 +367,54 @@ public class AuthController {
                 .body(new AccessTokenResponseDto(accessToken, "Bearer", accessTokenTtl.toSeconds()));
     }
 
+    @PostMapping("/internal/service-token")
+    @Operation(
+            summary = "Issue internal service token",
+            description = "Issues a short-lived service token for internal calls. Requires the internal API key header."
+    )
+    @ApiResponses({
+            @ApiResponse(
+                    responseCode = "200",
+                    description = "Service token issued which can be used for internal calls.",
+                    content = @Content(
+                            mediaType = "application/json",
+                            schema = @Schema(implementation = AccessTokenResponseDto.class)
+                    )
+            ),
+            @ApiResponse(
+                    responseCode = "400",
+                    description = "Validation error.",
+                    content = @Content(
+                            mediaType = "application/json",
+                            schema = @Schema(implementation = ApiErrorDto.class)
+                    )
+            ),
+            @ApiResponse(
+                    responseCode = "401",
+                    description = "Invalid internal API key.",
+                    content = @Content(
+                            mediaType = "application/json",
+                            schema = @Schema(implementation = ApiErrorDto.class)
+                    )
+            )
+    })
+    public ResponseEntity<AccessTokenResponseDto> issueServiceToken(
+            @RequestHeader(value = INTERNAL_API_KEY_HEADER, required = false) String headerValue,
+            @Valid @RequestBody ServiceTokenRequestDto request
+    ) {
+        verifyInternalApiKey(headerValue);
+
+        String accessToken = jwtTokenService.issueServiceToken(
+                request.getServiceName(),
+                request.getTenantId(),
+                request.getAud(),
+                request.getScopes()
+        );
+
+        AccessTokenResponseDto response = new AccessTokenResponseDto(accessToken, "Bearer", jwtTokenService.getServiceTokenTtlSeconds());
+        return ResponseEntity.ok(response);
+    }
+
     @PostMapping("/logout")
     @Operation(
             summary = "Logout current session",
@@ -563,6 +616,15 @@ public class AuthController {
     private void ensureSamePayload(IdempotencyRecord record, String requestHash) {
         if (!Objects.equals(record.getRequestHash(), requestHash)) {
             throw new AppException(CONFLICT, ErrorCode.IDEMPOTENCY_CONFLICT, "Idempotency-Key already used with a different payload");
+        }
+    }
+
+    private void verifyInternalApiKey(String headerValue) {
+        if (internalApiKey == null || internalApiKey.isBlank()) {
+            return;
+        }
+        if (!Objects.equals(internalApiKey, headerValue)) {
+            throw new AppException(UNAUTHORIZED, ErrorCode.INTERNAL_API_KEY_INVALID, "Invalid internal API key");
         }
     }
 
