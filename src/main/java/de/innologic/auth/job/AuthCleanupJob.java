@@ -37,7 +37,7 @@ public class AuthCleanupJob {
         Instant now = Instant.now();
         Instant pendingCutoff = now.minus(pendingRegistrationTtl);
 
-        long deletedPending = credentialRepository.deleteByUserStatusInAndCreatedAtBefore(
+        long deletedPending = credentialRepository.deleteByStatusInAndCreatedAtBefore(
                 List.of(UserStatus.PENDING_EMAIL_VERIFICATION, UserStatus.ACTIVATION_IN_PROGRESS),
                 pendingCutoff
         );

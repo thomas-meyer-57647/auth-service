@@ -1,9 +1,9 @@
 package de.innologic.auth.service;
 
-import de.innologic.auth.domain.entity.Credential;
-import de.innologic.auth.domain.entity.Session;
+import de.innologic.auth.domain.entity.AuthCredential;
+import de.innologic.auth.domain.entity.RefreshSession;
 import de.innologic.auth.domain.enums.SessionPolicy;
-import de.innologic.auth.domain.repository.SessionRepository;
+import de.innologic.auth.domain.repository.RefreshSessionRepository;
 import de.innologic.auth.web.error.AppException;
 import de.innologic.auth.web.error.ErrorCode;
 import org.springframework.http.HttpStatus;
@@ -16,22 +16,26 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Base64;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 public class SessionService {
 
-    private final SessionRepository sessionRepository;
+    private final RefreshSessionRepository sessionRepository;
     private final Map<String, Long> rotatedRefreshHashes = new ConcurrentHashMap<>();
 
-    public SessionService(SessionRepository sessionRepository) {
+    public SessionService(RefreshSessionRepository sessionRepository) {
         this.sessionRepository = sessionRepository;
     }
 
-    public SessionWithToken createSession(Credential credential, SessionPolicy policy, String ipAddress, String userAgent) {
+    public SessionWithToken createSession(AuthCredential credential, SessionPolicy policy, String ipAddress, String userAgent) {
         String refreshToken = generateOpaqueToken();
-        Session session = new Session();
+        RefreshSession session = new RefreshSession();
         session.setCredential(credential);
+        session.setSid(generateSid());
+        session.setUserId(credential.getUserId());
+        session.setTenantId(null);
         session.setSessionPolicy(policy);
         session.setRefreshTokenHash(hash(refreshToken));
         session.setIpAddress(ipAddress);
@@ -46,7 +50,7 @@ public class SessionService {
 
     public RotationResult rotateRefreshToken(String rawRefreshToken) {
         String presentedHash = hash(rawRefreshToken);
-        Session session = sessionRepository.findByRefreshTokenHash(presentedHash).orElse(null);
+        RefreshSession session = sessionRepository.findByRefreshTokenHash(presentedHash).orElse(null);
 
         if (session == null) {
             Long compromisedSessionId = rotatedRefreshHashes.get(presentedHash);
@@ -76,6 +80,7 @@ public class SessionService {
         session.setUpdatedAt(Instant.now());
         sessionRepository.save(session);
 
+        session.setLastUsedAt(Instant.now());
         return new RotationResult(session, newRefreshToken);
     }
 
@@ -89,7 +94,7 @@ public class SessionService {
     }
 
     public void revokeAllSessionsForCredential(Long credentialId) {
-        for (Session session : sessionRepository.findAllByCredentialIdAndRevokedAtIsNull(credentialId)) {
+        for (RefreshSession session : sessionRepository.findAllByCredentialIdAndRevokedAtIsNull(credentialId)) {
             session.setRevokedAt(Instant.now());
             session.setUpdatedAt(Instant.now());
             sessionRepository.save(session);
@@ -110,6 +115,10 @@ public class SessionService {
         return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
     }
 
+    private String generateSid() {
+        return UUID.randomUUID().toString();
+    }
+
     private String hash(String input) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
@@ -124,9 +133,9 @@ public class SessionService {
         }
     }
 
-    public record SessionWithToken(Session session, String refreshToken) {
+    public record SessionWithToken(RefreshSession session, String refreshToken) {
     }
 
-    public record RotationResult(Session session, String newRefreshToken) {
+    public record RotationResult(RefreshSession session, String newRefreshToken) {
     }
 }

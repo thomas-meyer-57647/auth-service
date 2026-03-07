@@ -14,27 +14,30 @@ import java.time.Instant;
 
 @Entity
 @Table(name = "credentials")
-public class Credential {
+public class AuthCredential {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(name = "email", nullable = false, unique = true, length = 255)
-    private String email;
+    @Column(name = "user_id", length = 64)
+    private String userId;
+
+    @Column(name = "login_email", nullable = false, unique = true, length = 255)
+    private String loginEmail;
 
     @Column(name = "password_hash", length = 255)
     private String passwordHash;
 
     @Enumerated(EnumType.STRING)
-    @Column(name = "user_status", nullable = false, length = 64)
-    private UserStatus userStatus;
+    @Column(name = "status", nullable = false, length = 64)
+    private UserStatus status;
 
     @Column(name = "email_verified", nullable = false)
     private boolean emailVerified;
 
-    @Column(name = "failed_login_attempts", nullable = false)
-    private int failedLoginAttempts;
+    @Column(name = "failed_attempts", nullable = false)
+    private int failedAttempts;
 
     @Column(name = "locked_until")
     private Instant lockedUntil;
@@ -45,8 +48,8 @@ public class Credential {
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
-    @Column(name = "updated_at", nullable = false)
-    private Instant updatedAt;
+    @Column(name = "modified_at", nullable = false)
+    private Instant modifiedAt;
 
     public Long getId() {
         return id;
@@ -56,12 +59,20 @@ public class Credential {
         this.id = id;
     }
 
-    public String getEmail() {
-        return email;
+    public String getUserId() {
+        return userId;
     }
 
-    public void setEmail(String email) {
-        this.email = email;
+    public void setUserId(String userId) {
+        this.userId = userId;
+    }
+
+    public String getLoginEmail() {
+        return loginEmail;
+    }
+
+    public void setLoginEmail(String loginEmail) {
+        this.loginEmail = loginEmail;
     }
 
     public String getPasswordHash() {
@@ -72,12 +83,12 @@ public class Credential {
         this.passwordHash = passwordHash;
     }
 
-    public UserStatus getUserStatus() {
-        return userStatus;
+    public UserStatus getStatus() {
+        return status;
     }
 
-    public void setUserStatus(UserStatus userStatus) {
-        this.userStatus = userStatus;
+    public void setStatus(UserStatus status) {
+        this.status = status;
     }
 
     public boolean isEmailVerified() {
@@ -88,12 +99,12 @@ public class Credential {
         this.emailVerified = emailVerified;
     }
 
-    public int getFailedLoginAttempts() {
-        return failedLoginAttempts;
+    public int getFailedAttempts() {
+        return failedAttempts;
     }
 
-    public void setFailedLoginAttempts(int failedLoginAttempts) {
-        this.failedLoginAttempts = failedLoginAttempts;
+    public void setFailedAttempts(int failedAttempts) {
+        this.failedAttempts = failedAttempts;
     }
 
     public Instant getLockedUntil() {
@@ -120,11 +131,11 @@ public class Credential {
         this.createdAt = createdAt;
     }
 
-    public Instant getUpdatedAt() {
-        return updatedAt;
+    public Instant getModifiedAt() {
+        return modifiedAt;
     }
 
-    public void setUpdatedAt(Instant updatedAt) {
-        this.updatedAt = updatedAt;
+    public void setModifiedAt(Instant modifiedAt) {
+        this.modifiedAt = modifiedAt;
     }
 }

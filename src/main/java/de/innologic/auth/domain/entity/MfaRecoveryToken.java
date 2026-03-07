@@ -1,5 +1,6 @@
 package de.innologic.auth.domain.entity;
 
+import de.innologic.auth.domain.entity.AuthCredential;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.FetchType;
@@ -22,7 +23,7 @@ public class MfaRecoveryToken {
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "credential_id", nullable = false)
-    private Credential credential;
+    private AuthCredential credential;
 
     @Column(name = "token_hash", nullable = false, unique = true, length = 255)
     private String tokenHash;
@@ -44,11 +45,11 @@ public class MfaRecoveryToken {
         this.id = id;
     }
 
-    public Credential getCredential() {
+    public AuthCredential getCredential() {
         return credential;
     }
 
-    public void setCredential(Credential credential) {
+    public void setCredential(AuthCredential credential) {
         this.credential = credential;
     }
 

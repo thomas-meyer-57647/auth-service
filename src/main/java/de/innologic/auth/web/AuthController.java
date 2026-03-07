@@ -3,14 +3,14 @@ package de.innologic.auth.web;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import de.innologic.auth.config.MFAConfig;
-import de.innologic.auth.domain.entity.Credential;
+import de.innologic.auth.domain.entity.AuthCredential;
 import de.innologic.auth.domain.entity.IdempotencyRecord;
-import de.innologic.auth.domain.entity.Mfa;
-import de.innologic.auth.domain.entity.Session;
+import de.innologic.auth.domain.entity.MfaConfig;
+import de.innologic.auth.domain.entity.RefreshSession;
 import de.innologic.auth.domain.enums.SessionPolicy;
 import de.innologic.auth.domain.repository.CredentialRepository;
 import de.innologic.auth.domain.repository.IdempotencyRepository;
-import de.innologic.auth.domain.repository.MfaRepository;
+import de.innologic.auth.domain.repository.MfaConfigRepository;
 import de.innologic.auth.security.jwt.JwtTokenService;
 import de.innologic.auth.service.CredentialRecoveryService;
 import de.innologic.auth.service.SessionService;
@@ -89,7 +89,7 @@ public class AuthController {
     private static final String INTERNAL_API_KEY_HEADER = "X-Internal-Api-Key";
 
     private final CredentialRepository credentialRepository;
-    private final MfaRepository mfaRepository;
+    private final MfaConfigRepository mfaRepository;
     private final IdempotencyRepository idempotencyRepository;
     private final JwtTokenService jwtTokenService;
     private final SessionService sessionService;
@@ -107,7 +107,7 @@ public class AuthController {
 
     public AuthController(
             CredentialRepository credentialRepository,
-            MfaRepository mfaRepository,
+            MfaConfigRepository mfaRepository,
             IdempotencyRepository idempotencyRepository,
             JwtTokenService jwtTokenService,
             SessionService sessionService,
@@ -196,7 +196,7 @@ public class AuthController {
             }
         }
 
-        Credential credential = credentialRepository.findByEmail(request.getEmail())
+        AuthCredential credential = credentialRepository.findByLoginEmail(request.getEmail())
                 .orElseThrow(() -> new AppException(UNAUTHORIZED, ErrorCode.INVALID_CREDENTIALS, "Invalid e-mail or password"));
 
         if (credential.getPasswordHash() == null || !passwordEncoder.matches(request.getPassword(), credential.getPasswordHash())) {
@@ -282,14 +282,14 @@ public class AuthController {
             throw new AppException(BAD_REQUEST, ErrorCode.TOKEN_INVALID, "Invalid or expired loginTransactionId");
         }
 
-        Mfa mfa = mfaRepository.findByCredentialId(pending.credentialId())
+        MfaConfig mfa = mfaRepository.findByCredentialId(pending.credentialId())
                 .orElseThrow(() -> new AppException(UNAUTHORIZED, ErrorCode.MFA_REQUIRED, "MFA enrollment missing"));
 
-        if (!mfa.isEnabled() || mfa.getSecretEncrypted() == null || mfa.getSecretEncrypted().isBlank()) {
+        if (!mfa.isEnabled() || mfa.getTotpSecretEncrypted() == null || mfa.getTotpSecretEncrypted().isBlank()) {
             throw new AppException(UNAUTHORIZED, ErrorCode.MFA_REQUIRED, "MFA is not enabled");
         }
 
-        if (!isValidTotp(request.getTotpCode(), mfa.getSecretEncrypted(), Instant.now())) {
+        if (!isValidTotp(request.getTotpCode(), mfa.getTotpSecretEncrypted(), Instant.now())) {
             throw new AppException(BAD_REQUEST, ErrorCode.TOTP_INVALID, "Invalid TOTP code");
         }
 
@@ -299,7 +299,7 @@ public class AuthController {
                 httpRequest.getRemoteAddr(),
                 httpRequest.getHeader(HttpHeaders.USER_AGENT)
         );
-        Session session = sessionWithToken.session();
+        RefreshSession session = sessionWithToken.session();
         String refreshToken = sessionWithToken.refreshToken();
 
         String accessToken = jwtTokenService.issueAccessToken(
@@ -351,7 +351,7 @@ public class AuthController {
                 .orElseThrow(() -> new AppException(UNAUTHORIZED, ErrorCode.REFRESH_INVALID, "Refresh cookie missing"));
 
         SessionService.RotationResult rotation = sessionService.rotateRefreshToken(refreshToken);
-        Session session = rotation.session();
+        RefreshSession session = rotation.session();
 
         String accessToken = jwtTokenService.issueAccessToken(
                 session.getCredential().getId(),
@@ -564,7 +564,7 @@ public class AuthController {
         return ResponseEntity.ok(new LogoutResponseDto("MFA recovery confirmed"));
     }
 
-    private Credential loadCredential(Long credentialId) {
+    private AuthCredential loadCredential(Long credentialId) {
         return credentialRepository.findById(credentialId)
                 .orElseThrow(() -> new AppException(UNAUTHORIZED, ErrorCode.INVALID_CREDENTIALS, "Credential not found"));
     }

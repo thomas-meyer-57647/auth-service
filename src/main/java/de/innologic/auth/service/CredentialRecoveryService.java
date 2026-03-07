@@ -1,14 +1,14 @@
 package de.innologic.auth.service;
 
-import de.innologic.auth.domain.entity.Credential;
-import de.innologic.auth.domain.entity.Mfa;
+import de.innologic.auth.domain.entity.AuthCredential;
+import de.innologic.auth.domain.entity.MfaConfig;
 import de.innologic.auth.domain.entity.MfaRecoveryToken;
 import de.innologic.auth.domain.entity.PasswordResetToken;
 import de.innologic.auth.domain.enums.RecoveryChannel;
 import de.innologic.auth.domain.enums.UserStatus;
 import de.innologic.auth.domain.repository.CredentialRepository;
 import de.innologic.auth.domain.repository.MfaRecoveryTokenRepository;
-import de.innologic.auth.domain.repository.MfaRepository;
+import de.innologic.auth.domain.repository.MfaConfigRepository;
 import de.innologic.auth.domain.repository.PasswordResetTokenRepository;
 import de.innologic.auth.messaging.MessagingClient;
 import de.innologic.auth.web.error.AppException;
@@ -33,7 +33,7 @@ import static org.springframework.http.HttpStatus.BAD_REQUEST;
 public class CredentialRecoveryService {
 
     private final CredentialRepository credentialRepository;
-    private final MfaRepository mfaRepository;
+    private final MfaConfigRepository mfaRepository;
     private final PasswordResetTokenRepository passwordResetTokenRepository;
     private final MfaRecoveryTokenRepository mfaRecoveryTokenRepository;
     private final MessagingClient messagingClient;
@@ -44,7 +44,7 @@ public class CredentialRecoveryService {
 
     public CredentialRecoveryService(
             CredentialRepository credentialRepository,
-            MfaRepository mfaRepository,
+            MfaConfigRepository mfaRepository,
             PasswordResetTokenRepository passwordResetTokenRepository,
             MfaRecoveryTokenRepository mfaRecoveryTokenRepository,
             MessagingClient messagingClient,
@@ -63,12 +63,12 @@ public class CredentialRecoveryService {
     }
 
     public void initiatePasswordForgot(String email) {
-        Optional<Credential> credentialOpt = credentialRepository.findByEmail(email);
+        Optional<AuthCredential> credentialOpt = credentialRepository.findByLoginEmail(email);
         if (credentialOpt.isEmpty()) {
             return;
         }
 
-        Credential credential = credentialOpt.get();
+        AuthCredential credential = credentialOpt.get();
         String rawToken = "prt_" + generateOpaqueToken();
 
         PasswordResetToken token = new PasswordResetToken();
@@ -78,7 +78,7 @@ public class CredentialRecoveryService {
         token.setExpiresAt(Instant.now().plus(passwordResetTtl));
         passwordResetTokenRepository.save(token);
 
-        messagingClient.sendPasswordReset(credential.getEmail(), rawToken);
+        messagingClient.sendPasswordReset(credential.getLoginEmail(), rawToken);
     }
 
     public void resetPassword(String rawToken, String newPassword) {
@@ -89,9 +89,9 @@ public class CredentialRecoveryService {
             throw new AppException(HttpStatus.GONE, ErrorCode.TOKEN_EXPIRED, "Reset token is expired or already used");
         }
 
-        Credential credential = token.getCredential();
+        AuthCredential credential = token.getCredential();
         credential.setPasswordHash(passwordEncoder.encode(newPassword));
-        credential.setUpdatedAt(Instant.now());
+        credential.setModifiedAt(Instant.now());
         credentialRepository.save(credential);
         sessionService.revokeAllSessionsForCredential(credential.getId());
 
@@ -100,13 +100,13 @@ public class CredentialRecoveryService {
     }
 
     public void startMfaRecovery(String email, RecoveryChannel channel) {
-        Optional<Credential> credentialOpt = credentialRepository.findByEmail(email);
+        Optional<AuthCredential> credentialOpt = credentialRepository.findByLoginEmail(email);
         if (credentialOpt.isEmpty()) {
             return;
         }
 
-        Credential credential = credentialOpt.get();
-        Optional<Mfa> mfaOpt = mfaRepository.findByCredentialId(credential.getId());
+        AuthCredential credential = credentialOpt.get();
+        Optional<MfaConfig> mfaOpt = mfaRepository.findByCredentialId(credential.getId());
         if (mfaOpt.isEmpty() || !mfaOpt.get().isEnabled()) {
             return;
         }
@@ -119,7 +119,7 @@ public class CredentialRecoveryService {
         token.setExpiresAt(Instant.now().plus(mfaRecoveryTtl));
         mfaRecoveryTokenRepository.save(token);
 
-        messagingClient.sendMfaRecovery(credential.getEmail(), channel, rawToken);
+        messagingClient.sendMfaRecovery(credential.getLoginEmail(), channel, rawToken);
     }
 
     public void confirmMfaRecovery(String rawToken) {
@@ -130,16 +130,16 @@ public class CredentialRecoveryService {
             throw new AppException(BAD_REQUEST, ErrorCode.TOKEN_EXPIRED, "Recovery token is expired or already consumed");
         }
 
-        Credential credential = token.getCredential();
-        Mfa mfa = mfaRepository.findByCredentialId(credential.getId())
+        AuthCredential credential = token.getCredential();
+        MfaConfig mfa = mfaRepository.findByCredentialId(credential.getId())
                 .orElseThrow(() -> new AppException(BAD_REQUEST, ErrorCode.TOKEN_INVALID, "MFA record not found"));
 
         mfa.setEnabled(false);
-        mfa.setSecretEncrypted(null);
+        mfa.setTotpSecretEncrypted(null);
         mfa.setUpdatedAt(Instant.now());
         mfaRepository.save(mfa);
-        credential.setUserStatus(UserStatus.PENDING_MFA_ENROLLMENT);
-        credential.setUpdatedAt(Instant.now());
+        credential.setStatus(UserStatus.PENDING_MFA_ENROLLMENT);
+        credential.setModifiedAt(Instant.now());
         credentialRepository.save(credential);
         sessionService.revokeAllSessionsForCredential(credential.getId());
 

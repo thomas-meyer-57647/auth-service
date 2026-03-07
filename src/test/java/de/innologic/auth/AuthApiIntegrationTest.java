@@ -4,18 +4,18 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.SignedJWT;
-import de.innologic.auth.domain.entity.Credential;
+import de.innologic.auth.domain.entity.AuthCredential;
 import de.innologic.auth.security.jwt.JwtTokenService;
-import de.innologic.auth.domain.entity.Mfa;
+import de.innologic.auth.domain.entity.MfaConfig;
 import de.innologic.auth.domain.entity.PasswordResetToken;
 import de.innologic.auth.domain.enums.RecoveryChannel;
 import de.innologic.auth.domain.enums.UserStatus;
 import de.innologic.auth.domain.repository.CredentialRepository;
 import de.innologic.auth.domain.repository.IdempotencyRepository;
+import de.innologic.auth.domain.repository.MfaConfigRepository;
 import de.innologic.auth.domain.repository.MfaRecoveryTokenRepository;
-import de.innologic.auth.domain.repository.MfaRepository;
 import de.innologic.auth.domain.repository.PasswordResetTokenRepository;
-import de.innologic.auth.domain.repository.SessionRepository;
+import de.innologic.auth.domain.repository.RefreshSessionRepository;
 import de.innologic.auth.messaging.MessagingClient;
 import de.innologic.auth.web.filter.CorrelationIdFilter;
 import jakarta.servlet.http.Cookie;
@@ -72,10 +72,10 @@ class AuthApiIntegrationTest {
     private CredentialRepository credentialRepository;
 
     @Autowired
-    private MfaRepository mfaRepository;
+    private MfaConfigRepository mfaRepository;
 
     @Autowired
-    private SessionRepository sessionRepository;
+    private RefreshSessionRepository sessionRepository;
 
     @Autowired
     private IdempotencyRepository idempotencyRepository;
@@ -101,7 +101,7 @@ class AuthApiIntegrationTest {
 
     @Test
     void loginMfaRefreshLogout_happyPath() throws Exception {
-        Credential credential = createCredential("user@example.com", "P@ssw0rd!");
+        AuthCredential credential = createCredential("user@example.com", "P@ssw0rd!");
         createMfa(credential, "JBSWY3DPEHPK3PXP");
 
         MvcResult loginResult = mockMvc.perform(post(BASE + "/login")
@@ -187,7 +187,7 @@ class AuthApiIntegrationTest {
 
     @Test
     void mfaRecoveryStartConfirm_happyPath_setsReEnrollFlag() throws Exception {
-        Credential credential = createCredential("mfa@example.com", "Pass12345!");
+        AuthCredential credential = createCredential("mfa@example.com", "Pass12345!");
         createMfa(credential, "JBSWY3DPEHPK3PXP");
 
         mockMvc.perform(post(BASE + "/mfa/recovery/start")
@@ -204,11 +204,11 @@ class AuthApiIntegrationTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.message").value("MFA recovery confirmed"));
 
-        Credential updated = credentialRepository.findById(credential.getId()).orElseThrow();
-        Mfa updatedMfa = mfaRepository.findByCredentialId(credential.getId()).orElseThrow();
-        assertThat(updated.getUserStatus()).isEqualTo(UserStatus.PENDING_MFA_ENROLLMENT);
+        AuthCredential updated = credentialRepository.findById(credential.getId()).orElseThrow();
+        MfaConfig updatedMfa = mfaRepository.findByCredentialId(credential.getId()).orElseThrow();
+        assertThat(updated.getStatus()).isEqualTo(UserStatus.PENDING_MFA_ENROLLMENT);
         assertThat(updatedMfa.isEnabled()).isFalse();
-        assertThat(updatedMfa.getSecretEncrypted()).isNull();
+        assertThat(updatedMfa.getTotpSecretEncrypted()).isNull();
     }
 
     @Test
@@ -225,7 +225,7 @@ class AuthApiIntegrationTest {
 
     @Test
     void mfaVerifyWrongTotp_returns400TotpInvalid() throws Exception {
-        Credential credential = createCredential("totp@example.com", "Pass12345!");
+        AuthCredential credential = createCredential("totp@example.com", "Pass12345!");
         createMfa(credential, "JBSWY3DPEHPK3PXP");
 
         MvcResult login = mockMvc.perform(post(BASE + "/login")
@@ -254,7 +254,7 @@ class AuthApiIntegrationTest {
 
     @Test
     void resetWithExpiredToken_returns410TokenExpired() throws Exception {
-        Credential credential = createCredential("expired@example.com", "Pass12345!");
+        AuthCredential credential = createCredential("expired@example.com", "Pass12345!");
         String raw = "prt_expired_token";
 
         PasswordResetToken token = new PasswordResetToken();
@@ -374,23 +374,26 @@ class AuthApiIntegrationTest {
         assertThat(json(result).get("correlationId").asText()).isEqualTo(generatedCorrelationId);
     }
 
-    private Credential createCredential(String email, String password) {
-        Credential credential = new Credential();
-        credential.setEmail(email);
+    private AuthCredential createCredential(String email, String password) {
+        AuthCredential credential = new AuthCredential();
+        credential.setLoginEmail(email);
         credential.setPasswordHash(ENCODER.encode(password));
-        credential.setUserStatus(UserStatus.ACTIVE);
+        credential.setStatus(UserStatus.ACTIVE);
         credential.setEmailVerified(true);
-        credential.setFailedLoginAttempts(0);
+        credential.setFailedAttempts(0);
         credential.setCreatedAt(Instant.now());
-        credential.setUpdatedAt(Instant.now());
+        credential.setModifiedAt(Instant.now());
         return credentialRepository.save(credential);
     }
 
-    private void createMfa(Credential credential, String secretBase32) {
-        Mfa mfa = new Mfa();
+    private void createMfa(AuthCredential credential, String secretBase32) {
+        MfaConfig mfa = new MfaConfig();
         mfa.setCredential(credential);
         mfa.setEnabled(true);
-        mfa.setSecretEncrypted(secretBase32);
+        mfa.setTotpSecretEncrypted(secretBase32);
+        mfa.setSecondFactorType("TOTP");
+        mfa.setEmailChannelEnabled(true);
+        mfa.setSmsChannelEnabled(true);
         mfa.setCreatedAt(Instant.now());
         mfa.setUpdatedAt(Instant.now());
         mfaRepository.save(mfa);

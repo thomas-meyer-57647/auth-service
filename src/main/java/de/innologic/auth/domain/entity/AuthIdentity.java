@@ -1,5 +1,6 @@
 package de.innologic.auth.domain.entity;
 
+import de.innologic.auth.domain.entity.AuthCredential;
 import de.innologic.auth.domain.enums.Provider;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -23,7 +24,7 @@ import java.time.Instant;
                 @UniqueConstraint(name = "uk_identities_provider_subject", columnNames = {"provider", "provider_subject"})
         }
 )
-public class Identity {
+public class AuthIdentity {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -31,7 +32,7 @@ public class Identity {
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "credential_id", nullable = false)
-    private Credential credential;
+    private AuthCredential credential;
 
     @Enumerated(EnumType.STRING)
     @Column(name = "provider", nullable = false, length = 32)
@@ -54,12 +55,16 @@ public class Identity {
         this.id = id;
     }
 
-    public Credential getCredential() {
+    public AuthCredential getCredential() {
         return credential;
     }
 
-    public void setCredential(Credential credential) {
+    public void setCredential(AuthCredential credential) {
         this.credential = credential;
+    }
+
+    public Long getCredentialId() {
+        return credential != null ? credential.getId() : null;
     }
 
     public Provider getProvider() {

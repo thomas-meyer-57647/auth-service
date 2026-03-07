@@ -1,5 +1,6 @@
 package de.innologic.auth.domain.entity;
 
+import de.innologic.auth.domain.entity.AuthCredential;
 import de.innologic.auth.domain.enums.RecoveryChannel;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -16,8 +17,8 @@ import jakarta.persistence.Table;
 import java.time.Instant;
 
 @Entity
-@Table(name = "mfa")
-public class Mfa {
+@Table(name = "mfa_configs")
+public class MfaConfig {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -25,13 +26,22 @@ public class Mfa {
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "credential_id", nullable = false, unique = true)
-    private Credential credential;
+    private AuthCredential credential;
 
     @Column(name = "enabled", nullable = false)
     private boolean enabled;
 
-    @Column(name = "secret_encrypted", length = 512)
-    private String secretEncrypted;
+    @Column(name = "totp_secret_encrypted", length = 512)
+    private String totpSecretEncrypted;
+
+    @Column(name = "second_factor_type", length = 32)
+    private String secondFactorType;
+
+    @Column(name = "email_channel_enabled", nullable = false)
+    private boolean emailChannelEnabled;
+
+    @Column(name = "sms_channel_enabled", nullable = false)
+    private boolean smsChannelEnabled;
 
     @Enumerated(EnumType.STRING)
     @Column(name = "recovery_channel", length = 16)
@@ -46,7 +56,7 @@ public class Mfa {
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
-    @Column(name = "updated_at", nullable = false)
+    @Column(name = "modified_at", nullable = false)
     private Instant updatedAt;
 
     public Long getId() {
@@ -57,11 +67,11 @@ public class Mfa {
         this.id = id;
     }
 
-    public Credential getCredential() {
+    public AuthCredential getCredential() {
         return credential;
     }
 
-    public void setCredential(Credential credential) {
+    public void setCredential(AuthCredential credential) {
         this.credential = credential;
     }
 
@@ -73,12 +83,36 @@ public class Mfa {
         this.enabled = enabled;
     }
 
-    public String getSecretEncrypted() {
-        return secretEncrypted;
+    public String getSecondFactorType() {
+        return secondFactorType;
     }
 
-    public void setSecretEncrypted(String secretEncrypted) {
-        this.secretEncrypted = secretEncrypted;
+    public void setSecondFactorType(String secondFactorType) {
+        this.secondFactorType = secondFactorType;
+    }
+
+    public boolean isEmailChannelEnabled() {
+        return emailChannelEnabled;
+    }
+
+    public void setEmailChannelEnabled(boolean emailChannelEnabled) {
+        this.emailChannelEnabled = emailChannelEnabled;
+    }
+
+    public boolean isSmsChannelEnabled() {
+        return smsChannelEnabled;
+    }
+
+    public void setSmsChannelEnabled(boolean smsChannelEnabled) {
+        this.smsChannelEnabled = smsChannelEnabled;
+    }
+
+    public String getTotpSecretEncrypted() {
+        return totpSecretEncrypted;
+    }
+
+    public void setTotpSecretEncrypted(String totpSecretEncrypted) {
+        this.totpSecretEncrypted = totpSecretEncrypted;
     }
 
     public RecoveryChannel getRecoveryChannel() {

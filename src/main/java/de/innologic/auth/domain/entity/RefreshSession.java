@@ -1,5 +1,6 @@
 package de.innologic.auth.domain.entity;
 
+import de.innologic.auth.domain.entity.AuthCredential;
 import de.innologic.auth.domain.enums.SessionPolicy;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -16,8 +17,8 @@ import jakarta.persistence.Table;
 import java.time.Instant;
 
 @Entity
-@Table(name = "sessions")
-public class Session {
+@Table(name = "refresh_sessions")
+public class RefreshSession {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -25,7 +26,16 @@ public class Session {
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "credential_id", nullable = false)
-    private Credential credential;
+    private AuthCredential credential;
+
+    @Column(name = "sid", nullable = false, length = 64)
+    private String sid;
+
+    @Column(name = "user_id", length = 64)
+    private String userId;
+
+    @Column(name = "tenant_id", length = 64)
+    private String tenantId;
 
     @Enumerated(EnumType.STRING)
     @Column(name = "session_policy", nullable = false, length = 32)
@@ -42,6 +52,9 @@ public class Session {
 
     @Column(name = "expires_at", nullable = false)
     private Instant expiresAt;
+
+    @Column(name = "last_used_at")
+    private Instant lastUsedAt;
 
     @Column(name = "revoked_at")
     private Instant revokedAt;
@@ -60,12 +73,36 @@ public class Session {
         this.id = id;
     }
 
-    public Credential getCredential() {
+    public AuthCredential getCredential() {
         return credential;
     }
 
-    public void setCredential(Credential credential) {
+    public void setCredential(AuthCredential credential) {
         this.credential = credential;
+    }
+
+    public String getSid() {
+        return sid;
+    }
+
+    public void setSid(String sid) {
+        this.sid = sid;
+    }
+
+    public String getUserId() {
+        return userId;
+    }
+
+    public void setUserId(String userId) {
+        this.userId = userId;
+    }
+
+    public String getTenantId() {
+        return tenantId;
+    }
+
+    public void setTenantId(String tenantId) {
+        this.tenantId = tenantId;
     }
 
     public SessionPolicy getSessionPolicy() {
@@ -106,6 +143,14 @@ public class Session {
 
     public void setExpiresAt(Instant expiresAt) {
         this.expiresAt = expiresAt;
+    }
+
+    public Instant getLastUsedAt() {
+        return lastUsedAt;
+    }
+
+    public void setLastUsedAt(Instant lastUsedAt) {
+        this.lastUsedAt = lastUsedAt;
     }
 
     public Instant getRevokedAt() {
