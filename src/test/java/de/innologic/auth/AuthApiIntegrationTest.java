@@ -17,6 +17,7 @@ import de.innologic.auth.domain.repository.MfaRepository;
 import de.innologic.auth.domain.repository.PasswordResetTokenRepository;
 import de.innologic.auth.domain.repository.SessionRepository;
 import de.innologic.auth.messaging.MessagingClient;
+import de.innologic.auth.web.filter.CorrelationIdFilter;
 import jakarta.servlet.http.Cookie;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -53,7 +54,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @ActiveProfiles("test")
 class AuthApiIntegrationTest {
 
-    private static final String BASE = "";
+    private static final String BASE = "/auth";
     private static final BCryptPasswordEncoder ENCODER = new BCryptPasswordEncoder();
     private static final String INTERNAL_API_KEY_HEADER = "X-Internal-Api-Key";
     private static final String INTERNAL_API_KEY_VALUE = "internal-test-key";
@@ -219,7 +220,7 @@ class AuthApiIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"email\":\"badpass@example.com\",\"password\":\"wrong\"}"))
                 .andExpect(status().isUnauthorized())
-                .andExpect(jsonPath("$.code").value("INVALID_CREDENTIALS"));
+                .andExpect(jsonPath("$.errorCode").value("INVALID_CREDENTIALS"));
     }
 
     @Test
@@ -241,14 +242,14 @@ class AuthApiIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"loginTransactionId\":\"" + tx + "\",\"totpCode\":\"000000\",\"sessionPolicy\":\"HOURS_24\"}"))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("TOTP_INVALID"));
+                .andExpect(jsonPath("$.errorCode").value("TOTP_INVALID"));
     }
 
     @Test
     void refreshWithoutCookie_returns401RefreshInvalid() throws Exception {
         mockMvc.perform(post(BASE + "/refresh"))
                 .andExpect(status().isUnauthorized())
-                .andExpect(jsonPath("$.code").value("REFRESH_INVALID"));
+                .andExpect(jsonPath("$.errorCode").value("REFRESH_INVALID"));
     }
 
     @Test
@@ -267,7 +268,7 @@ class AuthApiIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"token\":\"" + raw + "\",\"newPassword\":\"NewPass123!\"}"))
                 .andExpect(status().isGone())
-                .andExpect(jsonPath("$.code").value("TOKEN_EXPIRED"));
+                .andExpect(jsonPath("$.errorCode").value("TOKEN_EXPIRED"));
     }
 
     @Test
@@ -285,7 +286,7 @@ class AuthApiIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"email\":\"idem@example.com\",\"password\":\"Different123!\"}"))
                 .andExpect(status().isConflict())
-                .andExpect(jsonPath("$.code").value("IDEMPOTENCY_CONFLICT"));
+                .andExpect(jsonPath("$.errorCode").value("IDEMPOTENCY_CONFLICT"));
     }
 
     @Test
@@ -320,7 +321,7 @@ class AuthApiIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(payload))
                 .andExpect(status().isUnauthorized())
-                .andExpect(jsonPath("$.code").value("INTERNAL_API_KEY_INVALID"));
+                .andExpect(jsonPath("$.errorCode").value("INTERNAL_API_KEY_INVALID"));
     }
 
     @Test
@@ -332,7 +333,45 @@ class AuthApiIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(payload))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("VALIDATION_ERROR"));
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    void validationErrorPropagatesCorrelationIdHeaderAndErrorFormat() throws Exception {
+        String correlationId = "cid-4f0e890d-3c4b-4f2f-b513-6c1a3d9c1a1f";
+
+        MvcResult result = mockMvc.perform(post(BASE + "/login")
+                        .header("Idempotency-Key", "idem-correlation-1")
+                        .header(CorrelationIdFilter.HEADER_NAME, correlationId)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"user@example.com\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"))
+                .andReturn();
+
+        JsonNode body = json(result);
+        assertThat(body.get("correlationId").asText()).isEqualTo(correlationId);
+        String expectedPath = result.getRequest().getRequestURI();
+        assertThat(body.get("path").asText()).isEqualTo(expectedPath);
+        assertThat(body.get("details").asText()).contains("MethodArgumentNotValidException");
+        assertThat(body.get("timestamp").asText()).isNotBlank();
+        assertThat(result.getResponse().getHeader(CorrelationIdFilter.HEADER_NAME)).isEqualTo(correlationId);
+    }
+
+    @Test
+    void validationErrorGeneratesCorrelationIdWhenHeaderMissing() throws Exception {
+        MvcResult result = mockMvc.perform(post(BASE + "/login")
+                        .header("Idempotency-Key", "idem-correlation-2")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"user@example.com\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.correlationId").exists())
+                .andReturn();
+
+        String generatedCorrelationId = result.getResponse().getHeader(CorrelationIdFilter.HEADER_NAME);
+        assertThat(generatedCorrelationId).isNotBlank();
+        assertThat(json(result).get("correlationId").asText()).isEqualTo(generatedCorrelationId);
     }
 
     private Credential createCredential(String email, String password) {

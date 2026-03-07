@@ -16,7 +16,7 @@ public class JwksController {
         this.jwtKeyService = jwtKeyService;
     }
 
-    @GetMapping(value = "/.well-known/jwks.json", produces = MediaType.APPLICATION_JSON_VALUE)
+    @GetMapping(value = "${auth.jwks.path}", produces = MediaType.APPLICATION_JSON_VALUE)
     public Map<String, Object> jwks() {
         return jwtKeyService.getPublicJwkSet().toJSONObject();
     }

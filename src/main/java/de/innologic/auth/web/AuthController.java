@@ -78,7 +78,7 @@ import static org.springframework.http.HttpStatus.CONFLICT;
 import static org.springframework.http.HttpStatus.UNAUTHORIZED;
 
 @RestController
-@RequestMapping(produces = MediaType.APPLICATION_JSON_VALUE)
+@RequestMapping(path = "/auth", produces = MediaType.APPLICATION_JSON_VALUE)
 @Validated
 @Tag(name = "Auth", description = "Authentication endpoints for login, MFA verify, refresh and logout.")
 public class AuthController {

@@ -26,6 +26,7 @@ public class CorrelationIdFilter extends OncePerRequestFilter {
         }
 
         MDC.put(MDC_KEY, correlationId);
+        request.setAttribute(HEADER_NAME, correlationId);
         response.setHeader(HEADER_NAME, correlationId);
 
         try {
