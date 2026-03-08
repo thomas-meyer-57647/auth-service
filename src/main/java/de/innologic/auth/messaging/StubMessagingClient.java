@@ -21,4 +21,9 @@ public class StubMessagingClient implements MessagingClient {
         // TODO Integrate with real e-mail/SMS provider.
         log.info("[MessagingStub] MFA recovery token for {} via {}: {}", recipient, channel, token);
     }
+
+    @Override
+    public void sendRegistrationVerification(String recipient, String registrationId, String token) {
+        log.info("[MessagingStub] Registration verification token for {} registrationId={}: {}", recipient, registrationId, token);
+    }
 }

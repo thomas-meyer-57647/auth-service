@@ -13,6 +13,7 @@ import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.AuthenticationException;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.server.ResponseStatusException;
@@ -28,6 +29,12 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(AppException.class)
     public ResponseEntity<ApiErrorDto> handleAppException(AppException ex, HttpServletRequest request, HttpServletResponse response) {
         return build(ex.getStatus(), ex.getErrorCode(), ex.getMessage(), request, response, ex);
+    }
+
+    @ExceptionHandler(MissingRequestHeaderException.class)
+    public ResponseEntity<ApiErrorDto> handleMissingHeader(MissingRequestHeaderException ex, HttpServletRequest request, HttpServletResponse response) {
+        String message = ex.getHeaderName() + " header is required";
+        return build(HttpStatus.BAD_REQUEST, ErrorCode.VALIDATION_ERROR, message, request, response, ex);
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

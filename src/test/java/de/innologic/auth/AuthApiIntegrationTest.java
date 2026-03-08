@@ -5,9 +5,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.SignedJWT;
 import de.innologic.auth.domain.entity.AuthCredential;
-import de.innologic.auth.security.jwt.JwtTokenService;
 import de.innologic.auth.domain.entity.MfaConfig;
 import de.innologic.auth.domain.entity.PasswordResetToken;
+import de.innologic.auth.domain.entity.RegistrationProcess;
+import de.innologic.auth.domain.entity.VerificationToken;
 import de.innologic.auth.domain.enums.RecoveryChannel;
 import de.innologic.auth.domain.enums.UserStatus;
 import de.innologic.auth.domain.repository.CredentialRepository;
@@ -16,7 +17,15 @@ import de.innologic.auth.domain.repository.MfaConfigRepository;
 import de.innologic.auth.domain.repository.MfaRecoveryTokenRepository;
 import de.innologic.auth.domain.repository.PasswordResetTokenRepository;
 import de.innologic.auth.domain.repository.RefreshSessionRepository;
+import de.innologic.auth.domain.repository.RegistrationProcessRepository;
+import de.innologic.auth.domain.repository.VerificationTokenRepository;
 import de.innologic.auth.messaging.MessagingClient;
+import de.innologic.auth.outbound.CompanyServiceClient;
+import de.innologic.auth.outbound.IamServiceClient;
+import de.innologic.auth.outbound.UserServiceClient;
+import de.innologic.auth.security.jwt.JwtTokenService;
+import de.innologic.auth.web.error.AppException;
+import de.innologic.auth.web.error.ErrorCode;
 import de.innologic.auth.web.filter.CorrelationIdFilter;
 import jakarta.servlet.http.Cookie;
 import org.junit.jupiter.api.BeforeEach;
@@ -26,8 +35,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
@@ -43,6 +54,8 @@ import javax.crypto.spec.SecretKeySpec;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -86,11 +99,28 @@ class AuthApiIntegrationTest {
     @Autowired
     private MfaRecoveryTokenRepository mfaRecoveryTokenRepository;
 
+    @Autowired
+    private RegistrationProcessRepository registrationProcessRepository;
+
+    @Autowired
+    private VerificationTokenRepository verificationTokenRepository;
+
     @MockitoBean
     private MessagingClient messagingClient;
 
+    @MockBean
+    private UserServiceClient userServiceClient;
+
+    @MockBean
+    private CompanyServiceClient companyServiceClient;
+
+    @MockBean
+    private IamServiceClient iamServiceClient;
+
     @BeforeEach
     void clean() {
+        verificationTokenRepository.deleteAll();
+        registrationProcessRepository.deleteAll();
         sessionRepository.deleteAll();
         mfaRecoveryTokenRepository.deleteAll();
         passwordResetTokenRepository.deleteAll();
@@ -374,6 +404,129 @@ class AuthApiIntegrationTest {
         assertThat(json(result).get("correlationId").asText()).isEqualTo(generatedCorrelationId);
     }
 
+    @Test
+    void registrationStart_successful_createsPendingContext() throws Exception {
+        ArgumentCaptor<String> recipientCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<String> registrationIdCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<String> tokenCaptor = ArgumentCaptor.forClass(String.class);
+
+        MvcResult result = mockMvc.perform(post("/registration/start")
+                        .header("Idempotency-Key", "idem-registration-start")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(registrationPayload("starter@example.com")))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.registrationId").exists())
+                .andExpect(jsonPath("$.status").value("PENDING_EMAIL_VERIFICATION"))
+                .andReturn();
+
+        JsonNode body = json(result);
+        String registrationId = body.get("registrationId").asText();
+
+        assertThat(registrationProcessRepository.findByRegistrationId(registrationId)).isPresent();
+        assertThat(credentialRepository.findByLoginEmail("starter@example.com")).isPresent();
+
+        verify(messagingClient).sendRegistrationVerification(recipientCaptor.capture(), registrationIdCaptor.capture(), tokenCaptor.capture());
+        assertThat(recipientCaptor.getValue()).isEqualTo("starter@example.com");
+        assertThat(registrationIdCaptor.getValue()).isEqualTo(registrationId);
+        assertThat(tokenCaptor.getValue()).startsWith("vt_");
+        assertThat(verificationTokenRepository.findAll()).hasSize(1);
+    }
+
+    @Test
+    void registrationStart_duplicateEmail_returnsConflict() throws Exception {
+        createCredential("duplicate@example.com", "Pass12345!");
+
+        mockMvc.perform(post("/registration/start")
+                        .header("Idempotency-Key", "idem-registration-duplicate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(registrationPayload("duplicate@example.com")))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("DUPLICATE_EMAIL"));
+    }
+
+    @Test
+    void registrationStart_requiresIdempotencyKey() throws Exception {
+        mockMvc.perform(post("/registration/start")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(registrationPayload("missing@example.com")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    void registrationVerify_successful_marksEmailVerified() throws Exception {
+        ArgumentCaptor<String> registrationIdCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<String> tokenCaptor = ArgumentCaptor.forClass(String.class);
+
+        MvcResult start = mockMvc.perform(post("/registration/start")
+                        .header("Idempotency-Key", "idem-registration-verify-start")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(registrationPayload("verify@example.com")))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        String registrationId = json(start).get("registrationId").asText();
+        verify(messagingClient).sendRegistrationVerification(anyString(), registrationIdCaptor.capture(), tokenCaptor.capture());
+        String token = tokenCaptor.getValue();
+
+        mockMvc.perform(post("/registration/verify-email")
+                        .header("Idempotency-Key", "idem-registration-verify")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"registrationId\":\"" + registrationId + "\",\"verificationToken\":\"" + token + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("EMAIL_VERIFIED"));
+
+        VerificationToken storedToken = verificationTokenRepository.findAll().get(0);
+        assertThat(storedToken.getUsedAt()).isNotNull();
+        assertThat(credentialRepository.findByLoginEmail("verify@example.com").get().getStatus()).isEqualTo(UserStatus.ACTIVATION_IN_PROGRESS);
+    }
+
+    @Test
+    void registrationVerify_invalidToken_returnsBadRequest() throws Exception {
+        MvcResult start = mockMvc.perform(post("/registration/start")
+                        .header("Idempotency-Key", "idem-registration-invalid-start")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(registrationPayload("invalid@example.com")))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        String registrationId = json(start).get("registrationId").asText();
+
+        mockMvc.perform(post("/registration/verify-email")
+                        .header("Idempotency-Key", "idem-registration-invalid")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"registrationId\":\"" + registrationId + "\",\"verificationToken\":\"vt_invalid\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("TOKEN_INVALID"));
+    }
+
+    @Test
+    void registrationVerify_expiredToken_returnsUnauthorized() throws Exception {
+        ArgumentCaptor<String> tokenCaptor = ArgumentCaptor.forClass(String.class);
+
+        MvcResult start = mockMvc.perform(post("/registration/start")
+                        .header("Idempotency-Key", "idem-registration-expired-start")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(registrationPayload("expired@example.com")))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        String registrationId = json(start).get("registrationId").asText();
+        verify(messagingClient).sendRegistrationVerification(anyString(), anyString(), tokenCaptor.capture());
+        String token = tokenCaptor.getValue();
+
+        VerificationToken storedToken = verificationTokenRepository.findAll().get(0);
+        storedToken.setExpiresAt(Instant.now().minusSeconds(1));
+        verificationTokenRepository.save(storedToken);
+
+        mockMvc.perform(post("/registration/verify-email")
+                        .header("Idempotency-Key", "idem-registration-expired")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"registrationId\":\"" + registrationId + "\",\"verificationToken\":\"" + token + "\"}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.errorCode").value("TOKEN_EXPIRED"));
+    }
+
     private AuthCredential createCredential(String email, String password) {
         AuthCredential credential = new AuthCredential();
         credential.setLoginEmail(email);
@@ -476,5 +629,239 @@ class AuthApiIntegrationTest {
         } catch (Exception e) {
             throw new IllegalStateException(e);
         }
+    }
+
+    private String registrationPayload(String email) {
+        return """
+                {
+                  "tenantId": "tenant-1",
+                  "userEmail": "%s",
+                  "userPassword": "Pass12345!",
+                  "companyPayload": {"companyName": "Acme GmbH"},
+                  "locationPayload": {"city": "Berlin"},
+                  "userPayload": {"firstName": "Max", "lastName": "Mustermann"}
+                }
+                """.formatted(email).trim();
+    }
+
+    @Test
+    void registrationMfaEnroll_successful_preparesTotpData() throws Exception {
+        RegistrationSetup setup = startRegistrationAndCaptureToken("mfa-enroll@example.com", "idem-mfa-enroll-success-start");
+        verifyRegistrationEmail(setup.registrationId(), setup.verificationToken(), "idem-mfa-enroll-success-verify");
+
+        MvcResult enroll = mockMvc.perform(post("/registration/mfa/totp/enroll")
+                        .header("Idempotency-Key", "idem-mfa-enroll-success")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"registrationId\":\"" + setup.registrationId() + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.secret").isString())
+                .andExpect(jsonPath("$.otpauthUri").isString())
+                .andExpect(jsonPath("$.status").value("MFA_ENROLLMENT_PREPARED"))
+                .andReturn();
+
+        String secret = json(enroll).get("secret").asText();
+        AuthCredential credential = credentialRepository.findByLoginEmail("mfa-enroll@example.com").orElseThrow();
+        MfaConfig config = mfaRepository.findByCredentialId(credential.getId()).orElseThrow();
+
+        assertThat(config.isEnabled()).isFalse();
+        assertThat(config.getTotpSecretEncrypted()).isEqualTo(secret);
+        assertThat(config.getSecondFactorType()).isEqualTo("TOTP");
+        assertThat(credential.getStatus()).isEqualTo(UserStatus.ACTIVATION_IN_PROGRESS);
+    }
+
+    @Test
+    void registrationMfaEnroll_requiresEmailVerified() throws Exception {
+        RegistrationSetup setup = startRegistrationAndCaptureToken("mfa-unverified@example.com", "idem-mfa-enroll-unverified-start");
+
+        mockMvc.perform(post("/registration/mfa/totp/enroll")
+                        .header("Idempotency-Key", "idem-mfa-enroll-unverified")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"registrationId\":\"" + setup.registrationId() + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("EMAIL_NOT_VERIFIED"));
+    }
+
+    @Test
+    void registrationMfaConfirm_successful_activatesAfterTotp() throws Exception {
+        RegistrationSetup setup = startRegistrationAndCaptureToken("mfa-confirm@example.com", "idem-mfa-confirm-start");
+        verifyRegistrationEmail(setup.registrationId(), setup.verificationToken(), "idem-mfa-confirm-verify");
+
+        String secret = json(mockMvc.perform(post("/registration/mfa/totp/enroll")
+                                .header("Idempotency-Key", "idem-mfa-confirm-enroll")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("{\"registrationId\":\"" + setup.registrationId() + "\"}"))
+                        .andExpect(status().isOk()).andReturn())
+                .get("secret").asText();
+        String totp = generateTotpNow(secret);
+
+        mockMvc.perform(post("/registration/mfa/totp/confirm")
+                        .header("Idempotency-Key", "idem-mfa-confirm")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"registrationId\":\"" + setup.registrationId() + "\",\"totpCode\":\"" + totp + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("ACTIVE"));
+
+        AuthCredential credential = credentialRepository.findByLoginEmail("mfa-confirm@example.com").orElseThrow();
+        assertThat(credential.getStatus()).isEqualTo(UserStatus.ACTIVE);
+        MfaConfig config = mfaRepository.findByCredentialId(credential.getId()).orElseThrow();
+        assertThat(config.isEnabled()).isTrue();
+        assertThat(config.getEnrolledAt()).isNotNull();
+
+        RegistrationProcess process = registrationProcessRepository.findByRegistrationId(setup.registrationId()).orElseThrow();
+        assertThat(process.getStatus()).isEqualTo("ACTIVE");
+    }
+
+    @Test
+    void registrationMfaConfirm_invalidTotp_returnsBadRequest() throws Exception {
+        RegistrationSetup setup = startRegistrationAndCaptureToken("mfa-confirm-invalid@example.com", "idem-mfa-confirm-invalid-start");
+        verifyRegistrationEmail(setup.registrationId(), setup.verificationToken(), "idem-mfa-confirm-invalid-verify");
+
+        String secret = json(mockMvc.perform(post("/registration/mfa/totp/enroll")
+                                .header("Idempotency-Key", "idem-mfa-confirm-invalid-enroll")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("{\"registrationId\":\"" + setup.registrationId() + "\"}"))
+                        .andExpect(status().isOk()).andReturn())
+                .get("secret").asText();
+
+        mockMvc.perform(post("/registration/mfa/totp/confirm")
+                        .header("Idempotency-Key", "idem-mfa-confirm-invalid")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"registrationId\":\"" + setup.registrationId() + "\",\"totpCode\":\"000000\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("TOTP_INVALID"));
+
+        AuthCredential credential = credentialRepository.findByLoginEmail("mfa-confirm-invalid@example.com").orElseThrow();
+        assertThat(credential.getStatus()).isEqualTo(UserStatus.ACTIVATION_IN_PROGRESS);
+        MfaConfig config = mfaRepository.findByCredentialId(credential.getId()).orElseThrow();
+        assertThat(config.isEnabled()).isFalse();
+    }
+
+    private RegistrationSetup startRegistrationAndCaptureToken(String email, String idempotencyKey) throws Exception {
+        ArgumentCaptor<String> registrationIdCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<String> tokenCaptor = ArgumentCaptor.forClass(String.class);
+
+        MvcResult start = mockMvc.perform(post("/registration/start")
+                        .header("Idempotency-Key", idempotencyKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(registrationPayload(email)))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        String registrationId = json(start).get("registrationId").asText();
+        verify(messagingClient).sendRegistrationVerification(anyString(), registrationIdCaptor.capture(), tokenCaptor.capture());
+        assertThat(registrationIdCaptor.getValue()).isEqualTo(registrationId);
+        return new RegistrationSetup(registrationId, tokenCaptor.getValue());
+    }
+
+    private void verifyRegistrationEmail(String registrationId, String token, String idempotencyKey) throws Exception {
+        mockMvc.perform(post("/registration/verify-email")
+                        .header("Idempotency-Key", idempotencyKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"registrationId\":\"" + registrationId + "\",\"verificationToken\":\"" + token + "\"}"))
+                .andExpect(status().isOk());
+    }
+
+    private static record RegistrationSetup(String registrationId, String verificationToken) {
+    }
+
+    @Test
+    void registrationActivation_success_callsDownstreamClients() throws Exception {
+        RegistrationSetup setup = startRegistrationAndCaptureToken("mfa-activation@example.com", "idem-mfa-activation-start");
+        verifyRegistrationEmail(setup.registrationId(), setup.verificationToken(), "idem-mfa-activation-verify");
+
+        String secret = json(mockMvc.perform(post("/registration/mfa/totp/enroll")
+                                .header("Idempotency-Key", "idem-mfa-activation-enroll")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("{\"registrationId\":\"" + setup.registrationId() + "\"}"))
+                        .andExpect(status().isOk()).andReturn())
+                .get("secret").asText();
+        String totp = generateTotpNow(secret);
+
+        mockMvc.perform(post("/registration/mfa/totp/confirm")
+                        .header("Idempotency-Key", "idem-mfa-activation-confirm")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"registrationId\":\"" + setup.registrationId() + "\",\"totpCode\":\"" + totp + "\"}"))
+                .andExpect(status().isOk());
+
+        verify(userServiceClient).activate(any());
+        verify(companyServiceClient).activate(any());
+        verify(iamServiceClient).assignTenantAdmin(any());
+    }
+
+    @Test
+    void registrationActivation_userServiceDown_returns503() throws Exception {
+        doThrow(new AppException(HttpStatus.SERVICE_UNAVAILABLE, ErrorCode.DOWNSTREAM_USER_UNAVAILABLE, "user service unavailable"))
+                .when(userServiceClient).activate(any());
+
+        RegistrationSetup setup = startRegistrationAndCaptureToken("mfa-activation-user-down@example.com", "idem-mfa-activation-user-start");
+        verifyRegistrationEmail(setup.registrationId(), setup.verificationToken(), "idem-mfa-activation-user-verify");
+
+        String secret = json(mockMvc.perform(post("/registration/mfa/totp/enroll")
+                                .header("Idempotency-Key", "idem-mfa-activation-user-enroll")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("{\"registrationId\":\"" + setup.registrationId() + "\"}"))
+                        .andExpect(status().isOk()).andReturn())
+                .get("secret").asText();
+        String totp = generateTotpNow(secret);
+
+        mockMvc.perform(post("/registration/mfa/totp/confirm")
+                        .header("Idempotency-Key", "idem-mfa-activation-user-confirm")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"registrationId\":\"" + setup.registrationId() + "\",\"totpCode\":\"" + totp + "\"}"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.errorCode").value("DOWNSTREAM_USER_UNAVAILABLE"));
+
+        verify(companyServiceClient, never()).activate(any());
+        verify(iamServiceClient, never()).assignTenantAdmin(any());
+    }
+
+    @Test
+    void registrationActivation_companyServiceDown_returns503() throws Exception {
+        doThrow(new AppException(HttpStatus.SERVICE_UNAVAILABLE, ErrorCode.DOWNSTREAM_COMPANY_UNAVAILABLE, "company service unavailable"))
+                .when(companyServiceClient).activate(any());
+
+        RegistrationSetup setup = startRegistrationAndCaptureToken("mfa-activation-company-down@example.com", "idem-mfa-activation-company-start");
+        verifyRegistrationEmail(setup.registrationId(), setup.verificationToken(), "idem-mfa-activation-company-verify");
+
+        String secret = json(mockMvc.perform(post("/registration/mfa/totp/enroll")
+                                .header("Idempotency-Key", "idem-mfa-activation-company-enroll")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("{\"registrationId\":\"" + setup.registrationId() + "\"}"))
+                        .andExpect(status().isOk()).andReturn())
+                .get("secret").asText();
+        String totp = generateTotpNow(secret);
+
+        mockMvc.perform(post("/registration/mfa/totp/confirm")
+                        .header("Idempotency-Key", "idem-mfa-activation-company-confirm")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"registrationId\":\"" + setup.registrationId() + "\",\"totpCode\":\"" + totp + "\"}"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.errorCode").value("DOWNSTREAM_COMPANY_UNAVAILABLE"));
+
+        verify(iamServiceClient, never()).assignTenantAdmin(any());
+    }
+
+    @Test
+    void registrationActivation_iamServiceDown_returns503() throws Exception {
+        doThrow(new AppException(HttpStatus.SERVICE_UNAVAILABLE, ErrorCode.DOWNSTREAM_IAM_UNAVAILABLE, "iam service unavailable"))
+                .when(iamServiceClient).assignTenantAdmin(any());
+
+        RegistrationSetup setup = startRegistrationAndCaptureToken("mfa-activation-iam-down@example.com", "idem-mfa-activation-iam-start");
+        verifyRegistrationEmail(setup.registrationId(), setup.verificationToken(), "idem-mfa-activation-iam-verify");
+
+        String secret = json(mockMvc.perform(post("/registration/mfa/totp/enroll")
+                                .header("Idempotency-Key", "idem-mfa-activation-iam-enroll")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("{\"registrationId\":\"" + setup.registrationId() + "\"}"))
+                        .andExpect(status().isOk()).andReturn())
+                .get("secret").asText();
+        String totp = generateTotpNow(secret);
+
+        mockMvc.perform(post("/registration/mfa/totp/confirm")
+                        .header("Idempotency-Key", "idem-mfa-activation-iam-confirm")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"registrationId\":\"" + setup.registrationId() + "\",\"totpCode\":\"" + totp + "\"}"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.errorCode").value("DOWNSTREAM_IAM_UNAVAILABLE"));
     }
 }

@@ -6,4 +6,6 @@ public interface MessagingClient {
     void sendPasswordReset(String recipient, String token);
 
     void sendMfaRecovery(String recipient, RecoveryChannel channel, String token);
+
+    void sendRegistrationVerification(String recipient, String registrationId, String token);
 }

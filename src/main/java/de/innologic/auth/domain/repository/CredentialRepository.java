@@ -11,5 +11,7 @@ import java.util.Optional;
 public interface CredentialRepository extends JpaRepository<AuthCredential, Long> {
     Optional<AuthCredential> findByLoginEmail(String loginEmail);
 
+    Optional<AuthCredential> findByUserId(String userId);
+
     long deleteByStatusInAndCreatedAtBefore(Collection<UserStatus> statuses, Instant before);
 }
