@@ -7,6 +7,8 @@ import de.innologic.auth.domain.entity.IdempotencyRecord;
 import de.innologic.auth.domain.entity.RegistrationProcess;
 import de.innologic.auth.domain.repository.IdempotencyRepository;
 import de.innologic.auth.service.RegistrationService;
+import de.innologic.auth.domain.enums.Provider;
+import de.innologic.auth.service.SocialAuthService;
 import de.innologic.auth.web.dto.RegistrationMfaConfirmRequestDto;
 import de.innologic.auth.web.dto.RegistrationMfaConfirmResponseDto;
 import de.innologic.auth.web.dto.RegistrationMfaEnrollRequestDto;
@@ -15,6 +17,7 @@ import de.innologic.auth.web.dto.RegistrationStartRequestDto;
 import de.innologic.auth.web.dto.RegistrationStartResponseDto;
 import de.innologic.auth.web.dto.RegistrationVerifyRequestDto;
 import de.innologic.auth.web.dto.RegistrationVerifyResponseDto;
+import de.innologic.auth.web.dto.SocialRegistrationRequestDto;
 import de.innologic.auth.web.error.ApiErrorDto;
 import de.innologic.auth.web.error.AppException;
 import de.innologic.auth.web.error.ErrorCode;
@@ -61,13 +64,16 @@ public class RegistrationController {
     private final RegistrationService registrationService;
     private final IdempotencyRepository idempotencyRepository;
     private final ObjectMapper objectMapper;
+    private final SocialAuthService socialAuthService;
 
     public RegistrationController(RegistrationService registrationService,
                                   IdempotencyRepository idempotencyRepository,
-                                  ObjectMapper objectMapper) {
+                                  ObjectMapper objectMapper,
+                                  SocialAuthService socialAuthService) {
         this.registrationService = registrationService;
         this.idempotencyRepository = idempotencyRepository;
         this.objectMapper = objectMapper;
+        this.socialAuthService = socialAuthService;
     }
 
     @PostMapping("/start")
@@ -116,6 +122,70 @@ public class RegistrationController {
         );
 
         upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash, HttpStatus.CREATED.value(), toJson(response));
+        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+    }
+
+    @PostMapping("/social/google")
+    @Operation(summary = "Social registration via Google", description = "Starts a registration flow that is backed by a verified Google identity.")
+    @ApiResponses({
+            @ApiResponse(
+                    responseCode = "201",
+                    description = "Pending social registration saved and verification mail sent.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = RegistrationStartResponseDto.class))
+            ),
+            @ApiResponse(
+                    responseCode = "400",
+                    description = "Validation error.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
+            ),
+            @ApiResponse(
+                    responseCode = "401",
+                    description = "Social authentication failed or provider unavailable.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
+            ),
+            @ApiResponse(
+                    responseCode = "409",
+                    description = "Social identity already linked or e-mail already used.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
+            )
+    })
+    public ResponseEntity<RegistrationStartResponseDto> socialRegistrationGoogle(
+            @Valid @RequestBody SocialRegistrationRequestDto request
+    ) {
+        log.info("Handling social registration via Google correlationId={}", correlationId());
+        RegistrationStartResponseDto response = socialAuthService.registerWithProvider(Provider.GOOGLE, request);
+        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+    }
+
+    @PostMapping("/social/facebook")
+    @Operation(summary = "Social registration via Facebook", description = "Starts a registration flow that is backed by a verified Facebook identity.")
+    @ApiResponses({
+            @ApiResponse(
+                    responseCode = "201",
+                    description = "Pending social registration saved and verification mail sent.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = RegistrationStartResponseDto.class))
+            ),
+            @ApiResponse(
+                    responseCode = "400",
+                    description = "Validation error.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
+            ),
+            @ApiResponse(
+                    responseCode = "401",
+                    description = "Social authentication failed or provider unavailable.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
+            ),
+            @ApiResponse(
+                    responseCode = "409",
+                    description = "Social identity already linked or e-mail already used.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
+            )
+    })
+    public ResponseEntity<RegistrationStartResponseDto> socialRegistrationFacebook(
+            @Valid @RequestBody SocialRegistrationRequestDto request
+    ) {
+        log.info("Handling social registration via Facebook correlationId={}", correlationId());
+        RegistrationStartResponseDto response = socialAuthService.registerWithProvider(Provider.FACEBOOK, request);
         return ResponseEntity.status(HttpStatus.CREATED).body(response);
     }
 

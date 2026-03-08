@@ -9,6 +9,7 @@ import de.innologic.auth.domain.entity.MfaConfig;
 import de.innologic.auth.domain.entity.PasswordResetToken;
 import de.innologic.auth.domain.entity.RegistrationProcess;
 import de.innologic.auth.domain.entity.VerificationToken;
+import de.innologic.auth.domain.enums.Provider;
 import de.innologic.auth.domain.enums.RecoveryChannel;
 import de.innologic.auth.domain.enums.UserStatus;
 import de.innologic.auth.domain.repository.CredentialRepository;
@@ -19,11 +20,15 @@ import de.innologic.auth.domain.repository.PasswordResetTokenRepository;
 import de.innologic.auth.domain.repository.RefreshSessionRepository;
 import de.innologic.auth.domain.repository.RegistrationProcessRepository;
 import de.innologic.auth.domain.repository.VerificationTokenRepository;
+import de.innologic.auth.domain.repository.AuthIdentityRepository;
 import de.innologic.auth.messaging.MessagingClient;
 import de.innologic.auth.outbound.CompanyServiceClient;
 import de.innologic.auth.outbound.IamServiceClient;
 import de.innologic.auth.outbound.UserServiceClient;
 import de.innologic.auth.security.jwt.JwtTokenService;
+import de.innologic.auth.social.FacebookSocialProviderClient;
+import de.innologic.auth.social.GoogleSocialProviderClient;
+import de.innologic.auth.social.SocialUserInfo;
 import de.innologic.auth.web.error.AppException;
 import de.innologic.auth.web.error.ErrorCode;
 import de.innologic.auth.web.filter.CorrelationIdFilter;
@@ -58,6 +63,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -83,6 +89,9 @@ class AuthApiIntegrationTest {
 
     @Autowired
     private CredentialRepository credentialRepository;
+
+    @Autowired
+    private AuthIdentityRepository identityRepository;
 
     @Autowired
     private MfaConfigRepository mfaRepository;
@@ -117,6 +126,12 @@ class AuthApiIntegrationTest {
     @MockBean
     private IamServiceClient iamServiceClient;
 
+    @MockBean
+    private GoogleSocialProviderClient googleSocialProviderClient;
+
+    @MockBean
+    private FacebookSocialProviderClient facebookSocialProviderClient;
+
     @BeforeEach
     void clean() {
         verificationTokenRepository.deleteAll();
@@ -126,7 +141,10 @@ class AuthApiIntegrationTest {
         passwordResetTokenRepository.deleteAll();
         mfaRepository.deleteAll();
         idempotencyRepository.deleteAll();
+        identityRepository.deleteAll();
         credentialRepository.deleteAll();
+        when(googleSocialProviderClient.getProvider()).thenReturn(Provider.GOOGLE);
+        when(facebookSocialProviderClient.getProvider()).thenReturn(Provider.FACEBOOK);
     }
 
     @Test
@@ -527,6 +545,82 @@ class AuthApiIntegrationTest {
                 .andExpect(jsonPath("$.errorCode").value("TOKEN_EXPIRED"));
     }
 
+    @Test
+    void socialRegistrationGoogle_successfulCreatesPendingProcess() throws Exception {
+        SocialUserInfo googleUser = new SocialUserInfo("google-sub", "social@example.com");
+        when(googleSocialProviderClient.fetchUserInfo("google-token")).thenReturn(googleUser);
+
+        mockMvc.perform(post("/registration/social/google")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(socialRegistrationPayload("google-token")))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.registrationId").exists())
+                .andExpect(jsonPath("$.status").value("PENDING_EMAIL_VERIFICATION"));
+
+        assertThat(identityRepository.findByProviderAndProviderSubject(Provider.GOOGLE, "google-sub")).isPresent();
+        assertThat(credentialRepository.findByLoginEmail("social@example.com")).isPresent();
+    }
+
+    @Test
+    void socialLoginGoogle_successfulCreatesLoginTransaction() throws Exception {
+        SocialUserInfo googleUser = new SocialUserInfo("google-login", "social-login@example.com");
+        when(googleSocialProviderClient.fetchUserInfo("google-login-token")).thenReturn(googleUser);
+
+        mockMvc.perform(post("/registration/social/google")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(socialRegistrationPayload("google-login-token")))
+                .andExpect(status().isCreated());
+
+        mockMvc.perform(post("/auth/social/google")
+                        .header("Idempotency-Key", "social-login-google")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(socialLoginPayload("google-login-token")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.loginTransactionId").exists());
+    }
+
+    @Test
+    void socialRegistrationGoogle_providerUnavailable_returns503() throws Exception {
+        when(googleSocialProviderClient.fetchUserInfo("bad-token"))
+                .thenThrow(new AppException(HttpStatus.SERVICE_UNAVAILABLE, ErrorCode.SOCIAL_PROVIDER_UNAVAILABLE, "Google provider unavailable"));
+
+        mockMvc.perform(post("/registration/social/google")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(socialRegistrationPayload("bad-token")))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.errorCode").value("SOCIAL_PROVIDER_UNAVAILABLE"));
+    }
+
+    @Test
+    void socialRegistrationGoogle_identityAlreadyLinked_returnsConflict() throws Exception {
+        SocialUserInfo googleUser = new SocialUserInfo("google-dup", "dup@example.com");
+        when(googleSocialProviderClient.fetchUserInfo("google-dup-token")).thenReturn(googleUser);
+
+        mockMvc.perform(post("/registration/social/google")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(socialRegistrationPayload("google-dup-token")))
+                .andExpect(status().isCreated());
+
+        mockMvc.perform(post("/registration/social/google")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(socialRegistrationPayload("google-dup-token")))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("SOCIAL_IDENTITY_ALREADY_LINKED"));
+    }
+
+    @Test
+    void socialRegistrationGoogle_emailAlreadyUsed_returnsConflict() throws Exception {
+        createCredential("conflict@example.com", "Pass12345!");
+        SocialUserInfo googleUser = new SocialUserInfo("google-email", "conflict@example.com");
+        when(googleSocialProviderClient.fetchUserInfo("google-email-token")).thenReturn(googleUser);
+
+        mockMvc.perform(post("/registration/social/google")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(socialRegistrationPayload("google-email-token")))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("EMAIL_ALREADY_USED_BY_OTHER_PROVIDER"));
+    }
+
     private AuthCredential createCredential(String email, String password) {
         AuthCredential credential = new AuthCredential();
         credential.setLoginEmail(email);
@@ -642,6 +736,22 @@ class AuthApiIntegrationTest {
                   "userPayload": {"firstName": "Max", "lastName": "Mustermann"}
                 }
                 """.formatted(email).trim();
+    }
+
+    private String socialRegistrationPayload(String token) {
+        return """
+                {
+                  "tenantId": "tenant-social",
+                  "companyPayload": {"companyName": "Social Co"},
+                  "locationPayload": {"city": "Hamburg"},
+                  "userPayload": {"firstName": "Social", "lastName": "User"},
+                  "socialToken": "%s"
+                }
+                """.formatted(token);
+    }
+
+    private String socialLoginPayload(String token) {
+        return "{\"socialToken\":\"" + token + "\"}";
     }
 
     @Test

@@ -98,14 +98,40 @@ public class RegistrationService {
 
     public RegistrationStartResult startRegistration(RegistrationStartRequestDto request) {
         log.info("Starting registration start for email={} correlationId={}", request.getUserEmail(), correlationId());
-        Instant now = Instant.now();
         credentialRepository.findByLoginEmail(request.getUserEmail()).ifPresent(existing ->
                 handleDuplicateEmail(request.getUserEmail()));
+        String hashedPassword = passwordEncoder.encode(request.getUserPassword());
+        return createRegistration(
+                request.getTenantId(),
+                request.getUserEmail(),
+                hashedPassword,
+                request.getCompanyPayload(),
+                request.getLocationPayload(),
+                request.getUserPayload()
+        );
+    }
+
+    public RegistrationStartResult startSocialRegistration(String tenantId,
+                                                         JsonNode companyPayload,
+                                                         JsonNode locationPayload,
+                                                         JsonNode userPayload,
+                                                         String userEmail) {
+        log.info("Starting social registration start for email={} correlationId={}", userEmail, correlationId());
+        return createRegistration(tenantId, userEmail, null, companyPayload, locationPayload, userPayload);
+    }
+
+    private RegistrationStartResult createRegistration(String tenantId,
+                                                       String userEmail,
+                                                       String passwordHash,
+                                                       JsonNode companyPayload,
+                                                       JsonNode locationPayload,
+                                                       JsonNode userPayload) {
+        Instant now = Instant.now();
 
         AuthCredential credential = new AuthCredential();
         credential.setUserId(generateUserId());
-        credential.setLoginEmail(request.getUserEmail());
-        credential.setPasswordHash(passwordEncoder.encode(request.getUserPassword()));
+        credential.setLoginEmail(userEmail);
+        credential.setPasswordHash(passwordHash);
         credential.setStatus(UserStatus.PENDING_EMAIL_VERIFICATION);
         credential.setEmailVerified(false);
         credential.setFailedAttempts(0);
@@ -117,12 +143,12 @@ public class RegistrationService {
 
         RegistrationProcess process = new RegistrationProcess();
         process.setRegistrationId("reg_" + UUID.randomUUID());
-        process.setTenantId(request.getTenantId());
+        process.setTenantId(tenantId);
         process.setUserId(credential.getUserId());
         process.setStatus(STATUS_PENDING);
-        process.setCompanyPayload(serializePayload(request.getCompanyPayload()));
-        process.setLocationPayload(serializePayload(request.getLocationPayload()));
-        process.setUserPayload(serializePayload(request.getUserPayload()));
+        process.setCompanyPayload(serializePayload(companyPayload));
+        process.setLocationPayload(serializePayload(locationPayload));
+        process.setUserPayload(serializePayload(userPayload));
         process.setExpiresAt(now.plus(registrationTtl));
         process.setCreatedAt(now);
         process.setModifiedAt(now);
@@ -142,8 +168,8 @@ public class RegistrationService {
             log.warn("Failed to trigger messaging for registrationId={} correlationId={}", process.getRegistrationId(), correlationId(), e);
         }
 
-        log.info("Registration started for registrationId={} email={} correlationId={}", process.getRegistrationId(), request.getUserEmail(), correlationId());
-        return new RegistrationStartResult(process, rawToken);
+        log.info("Registration started for registrationId={} email={} correlationId={}", process.getRegistrationId(), userEmail, correlationId());
+        return new RegistrationStartResult(process, rawToken, credential);
     }
 
     public RegistrationProcess verifyEmail(RegistrationVerifyRequestDto request) {
@@ -311,10 +337,12 @@ public class RegistrationService {
     public static class RegistrationStartResult {
         private final RegistrationProcess process;
         private final String verificationToken;
+        private final AuthCredential credential;
 
-        public RegistrationStartResult(RegistrationProcess process, String verificationToken) {
+        public RegistrationStartResult(RegistrationProcess process, String verificationToken, AuthCredential credential) {
             this.process = process;
             this.verificationToken = verificationToken;
+            this.credential = credential;
         }
 
         public RegistrationProcess getProcess() {
@@ -323,6 +351,10 @@ public class RegistrationService {
 
         public String getVerificationToken() {
             return verificationToken;
+        }
+
+        public AuthCredential getCredential() {
+            return credential;
         }
     }
 

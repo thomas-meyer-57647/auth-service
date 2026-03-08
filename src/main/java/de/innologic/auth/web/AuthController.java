@@ -16,8 +16,11 @@ import de.innologic.auth.service.CredentialRecoveryService;
 import de.innologic.auth.service.SessionService;
 import de.innologic.auth.web.dto.AcceptedResponseDto;
 import de.innologic.auth.web.dto.AccessTokenResponseDto;
+import de.innologic.auth.domain.enums.Provider;
+import de.innologic.auth.service.SocialAuthService;
 import de.innologic.auth.web.dto.LoginRequestDto;
 import de.innologic.auth.web.dto.LoginResponseDto;
+import de.innologic.auth.web.dto.SocialLoginRequestDto;
 import de.innologic.auth.web.dto.LogoutResponseDto;
 import de.innologic.auth.web.dto.MfaRecoveryConfirmRequestDto;
 import de.innologic.auth.web.dto.MfaRecoveryStartRequestDto;
@@ -28,6 +31,7 @@ import de.innologic.auth.web.dto.ServiceTokenRequestDto;
 import de.innologic.auth.web.error.ApiErrorDto;
 import de.innologic.auth.web.error.AppException;
 import de.innologic.auth.web.error.ErrorCode;
+import de.innologic.auth.web.filter.CorrelationIdFilter;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.headers.Header;
@@ -41,8 +45,10 @@ import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseCookie;
 import org.springframework.http.ResponseEntity;
@@ -54,6 +60,8 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -70,6 +78,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -87,6 +96,7 @@ public class AuthController {
     private static final Duration LOGIN_TRANSACTION_TTL = Duration.ofMinutes(5);
     private static final Duration IDEMPOTENCY_TTL = Duration.ofHours(24);
     private static final String INTERNAL_API_KEY_HEADER = "X-Internal-Api-Key";
+    private static final Logger log = LoggerFactory.getLogger(AuthController.class);
 
     private final CredentialRepository credentialRepository;
     private final MfaConfigRepository mfaRepository;
@@ -96,6 +106,7 @@ public class AuthController {
     private final CredentialRecoveryService credentialRecoveryService;
     private final MFAConfig mfaConfig;
     private final ObjectMapper objectMapper;
+    private final SocialAuthService socialAuthService;
     private final PasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
     private final Map<String, PendingLoginTransaction> loginTransactions = new ConcurrentHashMap<>();
 
@@ -114,6 +125,7 @@ public class AuthController {
             CredentialRecoveryService credentialRecoveryService,
             MFAConfig mfaConfig,
             ObjectMapper objectMapper,
+            SocialAuthService socialAuthService,
             @Value("${auth.default-tenant-id:default}") String defaultTenantId,
             @Value("${auth.default-audience:auth-api}") String defaultAudience,
             @Value("${auth.default-scopes:openid,profile}") String defaultScopes,
@@ -128,6 +140,7 @@ public class AuthController {
         this.credentialRecoveryService = credentialRecoveryService;
         this.mfaConfig = mfaConfig;
         this.objectMapper = objectMapper;
+        this.socialAuthService = socialAuthService;
         this.defaultTenantId = defaultTenantId;
         this.defaultAudiences = splitCsv(defaultAudience);
         this.defaultScopes = splitCsv(defaultScopes);
@@ -184,8 +197,19 @@ public class AuthController {
             @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
             @Valid @RequestBody LoginRequestDto request
     ) {
+        log.info("Handling login transaction for email={} correlationId={}", request.getEmail(), correlationId());
         String requestHash = hash("login|" + request.getEmail() + "|" + request.getPassword());
+        return processLoginRequest(idempotencyKey, requestHash, () -> {
+            AuthCredential credential = credentialRepository.findByLoginEmail(request.getEmail())
+                    .orElseThrow(() -> new AppException(UNAUTHORIZED, ErrorCode.INVALID_CREDENTIALS, "Invalid e-mail or password"));
+            if (credential.getPasswordHash() == null || !passwordEncoder.matches(request.getPassword(), credential.getPasswordHash())) {
+                throw new AppException(UNAUTHORIZED, ErrorCode.INVALID_CREDENTIALS, "Invalid e-mail or password");
+            }
+            return createLoginTransaction(credential);
+        });
+    }
 
+    private ResponseEntity<LoginResponseDto> processLoginRequest(String idempotencyKey, String requestHash, Supplier<LoginResponseDto> action) {
         Optional<IdempotencyRecord> existing = idempotencyRepository.findByIdempotencyKey(idempotencyKey);
         if (existing.isPresent()) {
             IdempotencyRecord record = existing.get();
@@ -196,19 +220,87 @@ public class AuthController {
             }
         }
 
-        AuthCredential credential = credentialRepository.findByLoginEmail(request.getEmail())
-                .orElseThrow(() -> new AppException(UNAUTHORIZED, ErrorCode.INVALID_CREDENTIALS, "Invalid e-mail or password"));
+        LoginResponseDto response = action.get();
+        upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash, HttpStatus.OK.value(), toJson(response));
+        return ResponseEntity.ok(response);
+    }
 
-        if (credential.getPasswordHash() == null || !passwordEncoder.matches(request.getPassword(), credential.getPasswordHash())) {
-            throw new AppException(UNAUTHORIZED, ErrorCode.INVALID_CREDENTIALS, "Invalid e-mail or password");
-        }
-
+    private LoginResponseDto createLoginTransaction(AuthCredential credential) {
         String loginTransactionId = "ltx_" + UUID.randomUUID().toString().replace("-", "");
         loginTransactions.put(loginTransactionId, new PendingLoginTransaction(credential.getId(), Instant.now()));
+        return new LoginResponseDto(loginTransactionId);
+    }
 
-        LoginResponseDto response = new LoginResponseDto(loginTransactionId);
-        upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash, 200, toJson(response));
-        return ResponseEntity.ok(response);
+    @PostMapping("/social/google")
+    @Operation(summary = "Start social login via Google", description = "Creates a login transaction by validating a Google identity.")
+    @ApiResponses({
+            @ApiResponse(
+                    responseCode = "200",
+                    description = "Login transaction created.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = LoginResponseDto.class))
+            ),
+            @ApiResponse(
+                    responseCode = "400",
+                    description = "Validation failed.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
+            ),
+            @ApiResponse(
+                    responseCode = "401",
+                    description = "Social authentication failed or identity not linked.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
+            ),
+            @ApiResponse(
+                    responseCode = "503",
+                    description = "Social provider unavailable.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
+            )
+    })
+    public ResponseEntity<LoginResponseDto> socialLoginGoogle(
+            @Parameter(description = "Idempotency key for safe retries.", required = true, example = "ltx-social-google-1")
+            @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @Valid @RequestBody SocialLoginRequestDto request
+    ) {
+        log.info("Handling social login via Google correlationId={}", correlationId());
+        String requestHash = hash("social-login|google|" + request.getSocialToken());
+        return processLoginRequest(idempotencyKey, requestHash, () ->
+                createLoginTransaction(socialAuthService.resolveCredentialForLogin(Provider.GOOGLE, request.getSocialToken()))
+        );
+    }
+
+    @PostMapping("/social/facebook")
+    @Operation(summary = "Start social login via Facebook", description = "Creates a login transaction by validating a Facebook identity.")
+    @ApiResponses({
+            @ApiResponse(
+                    responseCode = "200",
+                    description = "Login transaction created.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = LoginResponseDto.class))
+            ),
+            @ApiResponse(
+                    responseCode = "400",
+                    description = "Validation failed.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
+            ),
+            @ApiResponse(
+                    responseCode = "401",
+                    description = "Social authentication failed or identity not linked.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
+            ),
+            @ApiResponse(
+                    responseCode = "503",
+                    description = "Social provider unavailable.",
+                    content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
+            )
+    })
+    public ResponseEntity<LoginResponseDto> socialLoginFacebook(
+            @Parameter(description = "Idempotency key for safe retries.", required = true, example = "ltx-social-facebook-1")
+            @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @Valid @RequestBody SocialLoginRequestDto request
+    ) {
+        log.info("Handling social login via Facebook correlationId={}", correlationId());
+        String requestHash = hash("social-login|facebook|" + request.getSocialToken());
+        return processLoginRequest(idempotencyKey, requestHash, () ->
+                createLoginTransaction(socialAuthService.resolveCredentialForLogin(Provider.FACEBOOK, request.getSocialToken()))
+        );
     }
 
     @PostMapping("/mfa/verify")
@@ -611,6 +703,11 @@ public class AuthController {
             }
         }
         return Optional.empty();
+    }
+
+    private String correlationId() {
+        String value = MDC.get(CorrelationIdFilter.MDC_KEY);
+        return value == null ? "n/a" : value;
     }
 
     private void ensureSamePayload(IdempotencyRecord record, String requestHash) {
