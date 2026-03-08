@@ -3,12 +3,19 @@ package de.innologic.auth.security.jwt;
 import com.nimbusds.jose.JOSEException;
 import com.nimbusds.jose.JWSAlgorithm;
 import com.nimbusds.jose.JWSHeader;
+import com.nimbusds.jose.JWSVerifier;
 import com.nimbusds.jose.crypto.RSASSASigner;
+import com.nimbusds.jose.crypto.RSASSAVerifier;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.SignedJWT;
+import de.innologic.auth.web.error.AppException;
+import de.innologic.auth.web.error.ErrorCode;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
+import java.security.interfaces.RSAPublicKey;
+import java.text.ParseException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Date;
@@ -22,18 +29,21 @@ public class JwtTokenService {
     private final JwtKeyService jwtKeyService;
     private final String issuer;
     private final Duration accessTokenTtl;
-    private final Duration serviceTokenTtl;
+    private final Duration serviceTokenDefaultTtl;
+    private final Duration serviceTokenMaxTtl;
 
     public JwtTokenService(
             JwtKeyService jwtKeyService,
             @Value("${auth.jwt.issuer:http://localhost:8080/api/v1/auth}") String issuer,
             @Value("${auth.jwt.access-token-ttl:PT15M}") Duration accessTokenTtl,
-            @Value("${auth.jwt.service-token-ttl:PT5M}") Duration serviceTokenTtl
+            @Value("${auth.jwt.service-token-ttl:PT5M}") Duration serviceTokenDefaultTtl,
+            @Value("${auth.jwt.service-token-max-ttl:PT5M}") Duration serviceTokenMaxTtl
     ) {
         this.jwtKeyService = jwtKeyService;
         this.issuer = issuer;
         this.accessTokenTtl = accessTokenTtl;
-        this.serviceTokenTtl = serviceTokenTtl;
+        this.serviceTokenDefaultTtl = serviceTokenDefaultTtl;
+        this.serviceTokenMaxTtl = serviceTokenMaxTtl;
     }
 
     public String issueAccessToken(
@@ -76,12 +86,13 @@ public class JwtTokenService {
         validateTenantAndLists(tenantId, audList, scopes);
     }
 
-    public String issueServiceToken(String serviceName, String tenantId, List<String> audList, List<String> scopes) {
+    public String issueServiceToken(String serviceName, String tenantId, List<String> audList, List<String> scopes, Duration ttl) {
         validateNonBlank(serviceName, "serviceName");
         validateTenantAndLists(tenantId, audList, scopes);
 
+        Objects.requireNonNull(ttl, "Service token TTL must not be null");
         Instant now = Instant.now();
-        Instant expiresAt = now.plus(serviceTokenTtl);
+        Instant expiresAt = now.plus(ttl);
 
         JWTClaimsSet claims = new JWTClaimsSet.Builder()
                 .issuer(issuer)
@@ -98,8 +109,36 @@ public class JwtTokenService {
         return sign(claims);
     }
 
-    public long getServiceTokenTtlSeconds() {
-        return serviceTokenTtl.getSeconds();
+    public Duration resolveServiceTokenTtl(Duration requestedTtl) {
+        Duration ttl = requestedTtl == null ? serviceTokenDefaultTtl : requestedTtl;
+        if (ttl.isZero() || ttl.isNegative()) {
+            throw new AppException(HttpStatus.BAD_REQUEST, ErrorCode.VALIDATION_ERROR, "Service token TTL must be positive");
+        }
+        if (ttl.compareTo(serviceTokenMaxTtl) > 0) {
+            throw new AppException(HttpStatus.BAD_REQUEST, ErrorCode.VALIDATION_ERROR, "Service token TTL exceeds maximum allowed");
+        }
+        return ttl;
+    }
+
+    public JWTClaimsSet validateAccessToken(String token) {
+        try {
+            SignedJWT signedJWT = SignedJWT.parse(token);
+            RSAPublicKey publicKey = jwtKeyService.getPublicKey();
+            JWSVerifier verifier = new RSASSAVerifier(publicKey);
+            if (!signedJWT.verify(verifier)) {
+                throw new AppException(HttpStatus.UNAUTHORIZED, ErrorCode.TOKEN_INVALID, "Access token is invalid");
+            }
+
+            JWTClaimsSet claims = signedJWT.getJWTClaimsSet();
+            Date expiration = claims.getExpirationTime();
+            if (expiration == null || expiration.before(Date.from(Instant.now()))) {
+                throw new AppException(HttpStatus.UNAUTHORIZED, ErrorCode.TOKEN_EXPIRED, "Access token is expired");
+            }
+
+            return claims;
+        } catch (ParseException | JOSEException e) {
+            throw new AppException(HttpStatus.UNAUTHORIZED, ErrorCode.TOKEN_INVALID, "Access token is invalid");
+        }
     }
 
     private void validateTenantAndLists(String tenantId, List<String> audList, List<String> scopes) {

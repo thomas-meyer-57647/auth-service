@@ -2,6 +2,7 @@ package de.innologic.auth.web;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nimbusds.jwt.JWTClaimsSet;
 import de.innologic.auth.config.MFAConfig;
 import de.innologic.auth.domain.entity.AuthCredential;
 import de.innologic.auth.domain.entity.IdempotencyRecord;
@@ -11,23 +12,23 @@ import de.innologic.auth.domain.enums.SessionPolicy;
 import de.innologic.auth.domain.repository.CredentialRepository;
 import de.innologic.auth.domain.repository.IdempotencyRepository;
 import de.innologic.auth.domain.repository.MfaConfigRepository;
+import de.innologic.auth.logging.StructuredLogBuilder;
 import de.innologic.auth.security.jwt.JwtTokenService;
 import de.innologic.auth.service.CredentialRecoveryService;
 import de.innologic.auth.service.SessionService;
 import de.innologic.auth.web.dto.AcceptedResponseDto;
 import de.innologic.auth.web.dto.AccessTokenResponseDto;
 import de.innologic.auth.domain.enums.Provider;
+import de.innologic.auth.domain.enums.RecoveryChannel;
 import de.innologic.auth.service.SocialAuthService;
 import de.innologic.auth.web.dto.LoginRequestDto;
 import de.innologic.auth.web.dto.LoginResponseDto;
+import de.innologic.auth.web.dto.PasswordChangeRequestDto;
 import de.innologic.auth.web.dto.SocialLoginRequestDto;
 import de.innologic.auth.web.dto.LogoutResponseDto;
-import de.innologic.auth.web.dto.MfaRecoveryConfirmRequestDto;
-import de.innologic.auth.web.dto.MfaRecoveryStartRequestDto;
 import de.innologic.auth.web.dto.MfaVerifyRequestDto;
 import de.innologic.auth.web.dto.PasswordForgotRequestDto;
 import de.innologic.auth.web.dto.PasswordResetRequestDto;
-import de.innologic.auth.web.dto.ServiceTokenRequestDto;
 import de.innologic.auth.web.error.ApiErrorDto;
 import de.innologic.auth.web.error.AppException;
 import de.innologic.auth.web.error.ErrorCode;
@@ -49,6 +50,7 @@ import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseCookie;
 import org.springframework.http.ResponseEntity;
@@ -95,8 +97,10 @@ public class AuthController {
     private static final String REFRESH_COOKIE_NAME = "AUTH_REFRESH";
     private static final Duration LOGIN_TRANSACTION_TTL = Duration.ofMinutes(5);
     private static final Duration IDEMPOTENCY_TTL = Duration.ofHours(24);
-    private static final String INTERNAL_API_KEY_HEADER = "X-Internal-Api-Key";
+    private static final String AUTHORIZATION_BEARER_PREFIX = "Bearer ";
     private static final Logger log = LoggerFactory.getLogger(AuthController.class);
+    private static final String TENANT_HEADER = "X-Tenant-Id";
+    private static final String AUTH_COOKIE_BASE_PATH = "/auth";
 
     private final CredentialRepository credentialRepository;
     private final MfaConfigRepository mfaRepository;
@@ -114,7 +118,6 @@ public class AuthController {
     private final List<String> defaultAudiences;
     private final List<String> defaultScopes;
     private final Duration accessTokenTtl;
-    private final String internalApiKey;
 
     public AuthController(
             CredentialRepository credentialRepository,
@@ -129,8 +132,7 @@ public class AuthController {
             @Value("${auth.default-tenant-id:default}") String defaultTenantId,
             @Value("${auth.default-audience:auth-api}") String defaultAudience,
             @Value("${auth.default-scopes:openid,profile}") String defaultScopes,
-            @Value("${auth.jwt.access-token-ttl:PT15M}") Duration accessTokenTtl,
-            @Value("${auth.internal.api-key:}") String internalApiKey
+            @Value("${auth.jwt.access-token-ttl:PT15M}") Duration accessTokenTtl
     ) {
         this.credentialRepository = credentialRepository;
         this.mfaRepository = mfaRepository;
@@ -145,7 +147,6 @@ public class AuthController {
         this.defaultAudiences = splitCsv(defaultAudience);
         this.defaultScopes = splitCsv(defaultScopes);
         this.accessTokenTtl = accessTokenTtl;
-        this.internalApiKey = internalApiKey;
     }
 
     @PostMapping("/login")
@@ -195,39 +196,64 @@ public class AuthController {
     public ResponseEntity<LoginResponseDto> login(
             @Parameter(description = "Idempotency key for safe retries.", required = true, example = "f84f5f4f-c13f-4f73-b2f1-62a95e3604d9")
             @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @Parameter(description = "Tenant context for the login request.", required = false, example = "tenant-42")
+            @RequestHeader(value = TENANT_HEADER, required = false) String tenantHeader,
             @Valid @RequestBody LoginRequestDto request
     ) {
-        log.info("Handling login transaction for email={} correlationId={}", request.getEmail(), correlationId());
         String requestHash = hash("login|" + request.getEmail() + "|" + request.getPassword());
-        return processLoginRequest(idempotencyKey, requestHash, () -> {
+        String tenantId = resolveTenantId(tenantHeader);
+        Instant start = Instant.now();
+        return processLoginRequest(idempotencyKey, requestHash, start, "auth.login.password", "/auth/login", tenantId, () -> {
             AuthCredential credential = credentialRepository.findByLoginEmail(request.getEmail())
                     .orElseThrow(() -> new AppException(UNAUTHORIZED, ErrorCode.INVALID_CREDENTIALS, "Invalid e-mail or password"));
             if (credential.getPasswordHash() == null || !passwordEncoder.matches(request.getPassword(), credential.getPasswordHash())) {
                 throw new AppException(UNAUTHORIZED, ErrorCode.INVALID_CREDENTIALS, "Invalid e-mail or password");
             }
-            return createLoginTransaction(credential);
+            return createLoginTransaction(credential, tenantId);
         });
     }
 
-    private ResponseEntity<LoginResponseDto> processLoginRequest(String idempotencyKey, String requestHash, Supplier<LoginResponseDto> action) {
-        Optional<IdempotencyRecord> existing = idempotencyRepository.findByIdempotencyKey(idempotencyKey);
-        if (existing.isPresent()) {
-            IdempotencyRecord record = existing.get();
-            ensureSamePayload(record, requestHash);
-            if (record.getResponseBody() != null) {
-                return ResponseEntity.status(record.getResponseStatus())
-                        .body(fromJson(record.getResponseBody(), LoginResponseDto.class));
+    private ResponseEntity<LoginResponseDto> processLoginRequest(String idempotencyKey,
+                                                                 String requestHash,
+                                                                 Instant start,
+                                                                 String eventName,
+                                                                 String requestPath,
+                                                                 String tenantId,
+                                                                 Supplier<LoginResponseDto> action) {
+        try {
+            Optional<IdempotencyRecord> existing = idempotencyRepository.findByIdempotencyKey(idempotencyKey);
+            if (existing.isPresent()) {
+                IdempotencyRecord record = existing.get();
+                ensureSamePayload(record, requestHash);
+                if (record.getResponseBody() != null) {
+                    HttpStatus replayStatus = record.getResponseStatus() == null ? HttpStatus.OK : HttpStatus.valueOf(record.getResponseStatus());
+                    LoginResponseDto cached = fromJson(record.getResponseBody(), LoginResponseDto.class);
+                    logAuthEvent(start, eventName, requestPath, replayStatus, "REPLAY", idempotencyKey, tenantId, cached.getLoginTransactionId(), null)
+                            .info("Login transaction replayed");
+                    return ResponseEntity.status(replayStatus)
+                            .body(cached);
+                }
             }
-        }
 
-        LoginResponseDto response = action.get();
-        upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash, HttpStatus.OK.value(), toJson(response));
-        return ResponseEntity.ok(response);
+            LoginResponseDto response = action.get();
+            upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash, HttpStatus.OK.value(), toJson(response));
+            logAuthEvent(start, eventName, requestPath, HttpStatus.OK, "SUCCESS", idempotencyKey, tenantId, response.getLoginTransactionId(), null)
+                    .info("Login transaction completed");
+            return ResponseEntity.ok(response);
+        } catch (AppException ex) {
+            logAuthEvent(start, eventName, requestPath, ex.getStatus(), "FAILURE", idempotencyKey, tenantId, null, ex.getErrorCode())
+                    .warn("Login transaction failed");
+            throw ex;
+        } catch (RuntimeException ex) {
+            logAuthEvent(start, eventName, requestPath, HttpStatus.INTERNAL_SERVER_ERROR, "FAILURE", idempotencyKey, tenantId, null, null)
+                    .error("Login transaction failed unexpectedly", ex);
+            throw ex;
+        }
     }
 
-    private LoginResponseDto createLoginTransaction(AuthCredential credential) {
+    private LoginResponseDto createLoginTransaction(AuthCredential credential, String tenantId) {
         String loginTransactionId = "ltx_" + UUID.randomUUID().toString().replace("-", "");
-        loginTransactions.put(loginTransactionId, new PendingLoginTransaction(credential.getId(), Instant.now()));
+        loginTransactions.put(loginTransactionId, new PendingLoginTransaction(credential.getId(), Instant.now(), tenantId));
         return new LoginResponseDto(loginTransactionId);
     }
 
@@ -258,12 +284,15 @@ public class AuthController {
     public ResponseEntity<LoginResponseDto> socialLoginGoogle(
             @Parameter(description = "Idempotency key for safe retries.", required = true, example = "ltx-social-google-1")
             @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @Parameter(description = "Tenant context for the social login request.", required = false, example = "tenant-42")
+            @RequestHeader(value = TENANT_HEADER, required = false) String tenantHeader,
             @Valid @RequestBody SocialLoginRequestDto request
     ) {
-        log.info("Handling social login via Google correlationId={}", correlationId());
         String requestHash = hash("social-login|google|" + request.getSocialToken());
-        return processLoginRequest(idempotencyKey, requestHash, () ->
-                createLoginTransaction(socialAuthService.resolveCredentialForLogin(Provider.GOOGLE, request.getSocialToken()))
+        String tenantId = resolveTenantId(tenantHeader);
+        Instant start = Instant.now();
+        return processLoginRequest(idempotencyKey, requestHash, start, "auth.login.social.google", "/auth/social/google", tenantId,
+                () -> createLoginTransaction(socialAuthService.resolveCredentialForLogin(Provider.GOOGLE, request.getSocialToken()), tenantId)
         );
     }
 
@@ -294,12 +323,15 @@ public class AuthController {
     public ResponseEntity<LoginResponseDto> socialLoginFacebook(
             @Parameter(description = "Idempotency key for safe retries.", required = true, example = "ltx-social-facebook-1")
             @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @Parameter(description = "Tenant context for the social login request.", required = false, example = "tenant-42")
+            @RequestHeader(value = TENANT_HEADER, required = false) String tenantHeader,
             @Valid @RequestBody SocialLoginRequestDto request
     ) {
-        log.info("Handling social login via Facebook correlationId={}", correlationId());
         String requestHash = hash("social-login|facebook|" + request.getSocialToken());
-        return processLoginRequest(idempotencyKey, requestHash, () ->
-                createLoginTransaction(socialAuthService.resolveCredentialForLogin(Provider.FACEBOOK, request.getSocialToken()))
+        String tenantId = resolveTenantId(tenantHeader);
+        Instant start = Instant.now();
+        return processLoginRequest(idempotencyKey, requestHash, start, "auth.login.social.facebook", "/auth/social/facebook", tenantId,
+                () -> createLoginTransaction(socialAuthService.resolveCredentialForLogin(Provider.FACEBOOK, request.getSocialToken()), tenantId)
         );
     }
 
@@ -354,63 +386,82 @@ public class AuthController {
             @Valid @RequestBody MfaVerifyRequestDto request,
             HttpServletRequest httpRequest
     ) {
+        Instant start = Instant.now();
         String requestHash = hash("mfa|" + request.getLoginTransactionId() + "|" + request.getTotpCode() + "|" + request.getSessionPolicy());
 
-        Optional<IdempotencyRecord> existing = idempotencyRepository.findByIdempotencyKey(idempotencyKey);
-        if (existing.isPresent()) {
-            IdempotencyRecord record = existing.get();
-            ensureSamePayload(record, requestHash);
-            if (record.getResponseBody() != null) {
-                MfaVerifyReplayPayload replay = fromJson(record.getResponseBody(), MfaVerifyReplayPayload.class);
-                return ResponseEntity.status(record.getResponseStatus())
-                        .header(HttpHeaders.SET_COOKIE, buildRefreshCookie(replay.getRefreshToken(), request.getSessionPolicy()).toString())
-                        .body(replay.getAccessToken());
+        try {
+            Optional<IdempotencyRecord> existing = idempotencyRepository.findByIdempotencyKey(idempotencyKey);
+            if (existing.isPresent()) {
+                IdempotencyRecord record = existing.get();
+                ensureSamePayload(record, requestHash);
+                if (record.getResponseBody() != null) {
+                    HttpStatus replayStatus = record.getResponseStatus() == null ? HttpStatus.OK : HttpStatus.valueOf(record.getResponseStatus());
+                    MfaVerifyReplayPayload replay = fromJson(record.getResponseBody(), MfaVerifyReplayPayload.class);
+                    logAuthEvent(start, "auth.mfa.verify", "/auth/mfa/verify", replayStatus, "REPLAY", idempotencyKey, null, request.getLoginTransactionId(), null)
+                            .info("MFA verification replayed");
+                    return ResponseEntity.status(replayStatus)
+                            .header(HttpHeaders.SET_COOKIE, buildRefreshCookie(replay.getRefreshToken(), request.getSessionPolicy(), httpRequest.getContextPath()).toString())
+                            .body(replay.getAccessToken());
+                }
             }
+
+            cleanupExpiredTransactions();
+            PendingLoginTransaction pending = loginTransactions.remove(request.getLoginTransactionId());
+            if (pending == null || pending.createdAt().plus(LOGIN_TRANSACTION_TTL).isBefore(Instant.now())) {
+                throw new AppException(BAD_REQUEST, ErrorCode.TOKEN_INVALID, "Invalid or expired loginTransactionId");
+            }
+            String tenantId = pending.tenantId();
+
+            MfaConfig mfa = mfaRepository.findByCredentialId(pending.credentialId())
+                    .orElseThrow(() -> new AppException(UNAUTHORIZED, ErrorCode.MFA_REQUIRED, "MFA enrollment missing"));
+
+            if (!mfa.isEnabled() || mfa.getTotpSecretEncrypted() == null || mfa.getTotpSecretEncrypted().isBlank()) {
+                throw new AppException(UNAUTHORIZED, ErrorCode.MFA_REQUIRED, "MFA is not enabled");
+            }
+
+            if (!isValidTotp(request.getTotpCode(), mfa.getTotpSecretEncrypted(), Instant.now())) {
+                throw new AppException(BAD_REQUEST, ErrorCode.TOTP_INVALID, "Invalid TOTP code");
+            }
+
+            SessionService.SessionWithToken sessionWithToken = sessionService.createSession(
+                    loadCredential(pending.credentialId()),
+                    request.getSessionPolicy(),
+                    pending.tenantId(),
+                    httpRequest.getRemoteAddr(),
+                    httpRequest.getHeader(HttpHeaders.USER_AGENT)
+            );
+            RefreshSession session = sessionWithToken.session();
+            String refreshToken = sessionWithToken.refreshToken();
+
+            String accessToken = jwtTokenService.issueAccessToken(
+                    pending.credentialId(),
+                    tenantForSession(session),
+                    String.valueOf(session.getId()),
+                    defaultAudiences,
+                    defaultScopes,
+                    List.of("pwd", "totp")
+            );
+
+            AccessTokenResponseDto response = new AccessTokenResponseDto(accessToken, "Bearer", accessTokenTtl.toSeconds());
+            MfaVerifyReplayPayload replayPayload = new MfaVerifyReplayPayload(response, refreshToken);
+
+            upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash, 200, toJson(replayPayload));
+
+            ResponseEntity<AccessTokenResponseDto> responseEntity = ResponseEntity.ok()
+                    .header(HttpHeaders.SET_COOKIE, buildRefreshCookie(refreshToken, request.getSessionPolicy(), httpRequest.getContextPath()).toString())
+                    .body(response);
+            logAuthEvent(start, "auth.mfa.verify", "/auth/mfa/verify", HttpStatus.OK, "SUCCESS", idempotencyKey, tenantId, request.getLoginTransactionId(), null)
+                    .info("MFA verification completed");
+            return responseEntity;
+        } catch (AppException ex) {
+            logAuthEvent(start, "auth.mfa.verify", "/auth/mfa/verify", ex.getStatus(), "FAILURE", idempotencyKey, null, request.getLoginTransactionId(), ex.getErrorCode())
+                    .warn("MFA verification failed");
+            throw ex;
+        } catch (RuntimeException ex) {
+            logAuthEvent(start, "auth.mfa.verify", "/auth/mfa/verify", HttpStatus.INTERNAL_SERVER_ERROR, "FAILURE", idempotencyKey, null, request.getLoginTransactionId(), null)
+                    .error("MFA verification failed unexpectedly", ex);
+            throw ex;
         }
-
-        cleanupExpiredTransactions();
-        PendingLoginTransaction pending = loginTransactions.remove(request.getLoginTransactionId());
-        if (pending == null || pending.createdAt().plus(LOGIN_TRANSACTION_TTL).isBefore(Instant.now())) {
-            throw new AppException(BAD_REQUEST, ErrorCode.TOKEN_INVALID, "Invalid or expired loginTransactionId");
-        }
-
-        MfaConfig mfa = mfaRepository.findByCredentialId(pending.credentialId())
-                .orElseThrow(() -> new AppException(UNAUTHORIZED, ErrorCode.MFA_REQUIRED, "MFA enrollment missing"));
-
-        if (!mfa.isEnabled() || mfa.getTotpSecretEncrypted() == null || mfa.getTotpSecretEncrypted().isBlank()) {
-            throw new AppException(UNAUTHORIZED, ErrorCode.MFA_REQUIRED, "MFA is not enabled");
-        }
-
-        if (!isValidTotp(request.getTotpCode(), mfa.getTotpSecretEncrypted(), Instant.now())) {
-            throw new AppException(BAD_REQUEST, ErrorCode.TOTP_INVALID, "Invalid TOTP code");
-        }
-
-        SessionService.SessionWithToken sessionWithToken = sessionService.createSession(
-                loadCredential(pending.credentialId()),
-                request.getSessionPolicy(),
-                httpRequest.getRemoteAddr(),
-                httpRequest.getHeader(HttpHeaders.USER_AGENT)
-        );
-        RefreshSession session = sessionWithToken.session();
-        String refreshToken = sessionWithToken.refreshToken();
-
-        String accessToken = jwtTokenService.issueAccessToken(
-                pending.credentialId(),
-                defaultTenantId,
-                String.valueOf(session.getId()),
-                defaultAudiences,
-                defaultScopes,
-                List.of("pwd", "totp")
-        );
-
-        AccessTokenResponseDto response = new AccessTokenResponseDto(accessToken, "Bearer", accessTokenTtl.toSeconds());
-        MfaVerifyReplayPayload replayPayload = new MfaVerifyReplayPayload(response, refreshToken);
-
-        upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash, 200, toJson(replayPayload));
-
-        return ResponseEntity.ok()
-                .header(HttpHeaders.SET_COOKIE, buildRefreshCookie(refreshToken, request.getSessionPolicy()).toString())
-                .body(response);
     }
 
     @PostMapping("/refresh")
@@ -438,73 +489,47 @@ public class AuthController {
                     )
             )
     })
-    public ResponseEntity<AccessTokenResponseDto> refresh(HttpServletRequest request) {
-        String refreshToken = readCookie(request, REFRESH_COOKIE_NAME)
-                .orElseThrow(() -> new AppException(UNAUTHORIZED, ErrorCode.REFRESH_INVALID, "Refresh cookie missing"));
-
-        SessionService.RotationResult rotation = sessionService.rotateRefreshToken(refreshToken);
-        RefreshSession session = rotation.session();
-
-        String accessToken = jwtTokenService.issueAccessToken(
-                session.getCredential().getId(),
-                defaultTenantId,
-                String.valueOf(session.getId()),
-                defaultAudiences,
-                defaultScopes,
-                List.of("refresh")
-        );
-
-        return ResponseEntity.ok()
-                .header(HttpHeaders.SET_COOKIE, buildRefreshCookie(rotation.newRefreshToken(), session.getSessionPolicy()).toString())
-                .body(new AccessTokenResponseDto(accessToken, "Bearer", accessTokenTtl.toSeconds()));
-    }
-
-    @PostMapping("/internal/service-token")
-    @Operation(
-            summary = "Issue internal service token",
-            description = "Issues a short-lived service token for internal calls. Requires the internal API key header."
-    )
-    @ApiResponses({
-            @ApiResponse(
-                    responseCode = "200",
-                    description = "Service token issued which can be used for internal calls.",
-                    content = @Content(
-                            mediaType = "application/json",
-                            schema = @Schema(implementation = AccessTokenResponseDto.class)
-                    )
-            ),
-            @ApiResponse(
-                    responseCode = "400",
-                    description = "Validation error.",
-                    content = @Content(
-                            mediaType = "application/json",
-                            schema = @Schema(implementation = ApiErrorDto.class)
-                    )
-            ),
-            @ApiResponse(
-                    responseCode = "401",
-                    description = "Invalid internal API key.",
-                    content = @Content(
-                            mediaType = "application/json",
-                            schema = @Schema(implementation = ApiErrorDto.class)
-                    )
-            )
-    })
-    public ResponseEntity<AccessTokenResponseDto> issueServiceToken(
-            @RequestHeader(value = INTERNAL_API_KEY_HEADER, required = false) String headerValue,
-            @Valid @RequestBody ServiceTokenRequestDto request
+    public ResponseEntity<AccessTokenResponseDto> refresh(
+            HttpServletRequest request,
+            @Parameter(description = "Tenant context for the refresh request.", required = false, example = "tenant-42")
+            @RequestHeader(value = TENANT_HEADER, required = false) String tenantHeader
     ) {
-        verifyInternalApiKey(headerValue);
+        Instant start = Instant.now();
+        try {
+            String refreshToken = readCookie(request, REFRESH_COOKIE_NAME)
+                    .orElseThrow(() -> new AppException(UNAUTHORIZED, ErrorCode.REFRESH_INVALID, "Refresh cookie missing"));
 
-        String accessToken = jwtTokenService.issueServiceToken(
-                request.getServiceName(),
-                request.getTenantId(),
-                request.getAud(),
-                request.getScopes()
-        );
+            SessionService.RotationResult rotation = sessionService.rotateRefreshToken(refreshToken);
+            RefreshSession session = rotation.session();
+            String normalizedTenantHeader = normalizeTenantHeader(tenantHeader);
+            ensureTenantMatchesHeader(normalizedTenantHeader, session);
 
-        AccessTokenResponseDto response = new AccessTokenResponseDto(accessToken, "Bearer", jwtTokenService.getServiceTokenTtlSeconds());
-        return ResponseEntity.ok(response);
+            String tenantId = tenantForSession(session);
+            String accessToken = jwtTokenService.issueAccessToken(
+                    session.getCredential().getId(),
+                    tenantId,
+                    String.valueOf(session.getId()),
+                    defaultAudiences,
+                    defaultScopes,
+                    List.of("refresh")
+            );
+
+            AccessTokenResponseDto responseBody = new AccessTokenResponseDto(accessToken, "Bearer", accessTokenTtl.toSeconds());
+            ResponseEntity<AccessTokenResponseDto> response = ResponseEntity.ok()
+                    .header(HttpHeaders.SET_COOKIE, buildRefreshCookie(rotation.newRefreshToken(), session.getSessionPolicy(), request.getContextPath()).toString())
+                    .body(responseBody);
+            logAuthEvent(start, "auth.refresh", "/auth/refresh", HttpStatus.OK, "SUCCESS", null, tenantId, null, null)
+                    .info("Refresh completed");
+            return response;
+        } catch (AppException ex) {
+            logAuthEvent(start, "auth.refresh", "/auth/refresh", ex.getStatus(), "FAILURE", null, null, null, ex.getErrorCode())
+                    .warn("Refresh failed");
+            throw ex;
+        } catch (RuntimeException ex) {
+            logAuthEvent(start, "auth.refresh", "/auth/refresh", HttpStatus.INTERNAL_SERVER_ERROR, "FAILURE", null, null, null, null)
+                    .error("Refresh failed unexpectedly", ex);
+            throw ex;
+        }
     }
 
     @PostMapping("/logout")
@@ -525,18 +550,31 @@ public class AuthController {
             )
     })
     public ResponseEntity<LogoutResponseDto> logout(HttpServletRequest request) {
-        readCookie(request, REFRESH_COOKIE_NAME).ifPresent(sessionService::revokeSessionByRefreshToken);
-
-        return ResponseEntity.ok()
-                .header(HttpHeaders.SET_COOKIE, clearRefreshCookie().toString())
-                .body(new LogoutResponseDto("Logged out"));
+        Instant start = Instant.now();
+        try {
+            readCookie(request, REFRESH_COOKIE_NAME).ifPresent(sessionService::revokeSessionByRefreshToken);
+            ResponseEntity<LogoutResponseDto> response = ResponseEntity.ok()
+                    .header(HttpHeaders.SET_COOKIE, clearRefreshCookie(request.getContextPath()).toString())
+                    .body(new LogoutResponseDto("Logged out"));
+            logAuthEvent(start, "auth.logout", "/auth/logout", HttpStatus.OK, "SUCCESS", null, null, null, null)
+                    .info("Logout completed");
+            return response;
+        } catch (AppException ex) {
+            logAuthEvent(start, "auth.logout", "/auth/logout", ex.getStatus(), "FAILURE", null, null, null, ex.getErrorCode())
+                    .warn("Logout failed");
+            throw ex;
+        } catch (RuntimeException ex) {
+            logAuthEvent(start, "auth.logout", "/auth/logout", HttpStatus.INTERNAL_SERVER_ERROR, "FAILURE", null, null, null, null)
+                    .error("Logout failed unexpectedly", ex);
+            throw ex;
+        }
     }
 
     @PostMapping("/password/forgot")
     @Operation(
             summary = "Start password reset",
             description = "Creates a short-lived password reset token (hashed in DB) and triggers MessagingClient delivery. " +
-                    "Always returns neutral 202 to avoid account enumeration."
+                    "Always returns neutral 202 to avoid account enumeration. Requires Idempotency-Key header."
     )
     @ApiResponses({
             @ApiResponse(
@@ -556,18 +594,41 @@ public class AuthController {
                             schema = @Schema(implementation = ApiErrorDto.class),
                             examples = @ExampleObject(value = "{\"timestamp\":\"2026-02-18T12:34:56Z\",\"status\":400,\"code\":\"VALIDATION_ERROR\",\"message\":\"Request validation failed\",\"path\":\"/api/v1/auth/password/forgot\"}")
                     )
+            ),
+            @ApiResponse(
+                    responseCode = "409",
+                    description = "Idempotency-Key reused with different payload.",
+                    content = @Content(
+                            mediaType = "application/json",
+                            schema = @Schema(implementation = ApiErrorDto.class)
+                    )
             )
     })
-    public ResponseEntity<AcceptedResponseDto> passwordForgot(@Valid @RequestBody PasswordForgotRequestDto request) {
-        credentialRecoveryService.initiatePasswordForgot(request.getEmail());
-        return ResponseEntity.accepted()
-                .body(new AcceptedResponseDto("If the account exists, further instructions were sent."));
+    public ResponseEntity<AcceptedResponseDto> passwordForgot(
+            @Parameter(description = "Idempotency key for safe retries.", required = true, example = "password-forgot-1")
+            @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @Valid @RequestBody PasswordForgotRequestDto request
+    ) {
+        String requestHash = hash("password-forgot|" + request.getEmail() + "|" + request.getChannel());
+        Instant start = Instant.now();
+        return processIdempotentResponse(
+                start,
+                "auth.password.forgot",
+                "/auth/password/forgot",
+                idempotencyKey,
+                requestHash,
+                AcceptedResponseDto.class,
+                () -> {
+                    credentialRecoveryService.initiatePasswordForgot(request.getEmail(), request.getChannel());
+                    return ResponseEntity.accepted().body(new AcceptedResponseDto("If the account exists, further instructions were sent."));
+                }
+        );
     }
 
     @PostMapping("/password/reset")
     @Operation(
             summary = "Reset password",
-            description = "Consumes a valid password reset token, updates password hash and marks token as used."
+            description = "Consumes a valid password reset token, updates password hash and marks token as used. Requires Idempotency-Key header."
     )
     @ApiResponses({
             @ApiResponse(
@@ -587,73 +648,94 @@ public class AuthController {
                             schema = @Schema(implementation = ApiErrorDto.class),
                             examples = @ExampleObject(value = "{\"timestamp\":\"2026-02-18T12:34:56Z\",\"status\":410,\"code\":\"TOKEN_EXPIRED\",\"message\":\"Reset token is expired or already used\",\"path\":\"/api/v1/auth/password/reset\"}")
                     )
+            ),
+            @ApiResponse(
+                    responseCode = "409",
+                    description = "Idempotency-Key reused with different payload.",
+                    content = @Content(
+                            mediaType = "application/json",
+                            schema = @Schema(implementation = ApiErrorDto.class)
+                    )
             )
     })
-    public ResponseEntity<LogoutResponseDto> passwordReset(@Valid @RequestBody PasswordResetRequestDto request) {
-        credentialRecoveryService.resetPassword(request.getToken(), request.getNewPassword());
-        return ResponseEntity.ok(new LogoutResponseDto("Password reset successful"));
+    public ResponseEntity<LogoutResponseDto> passwordReset(
+            @Parameter(description = "Idempotency key for safe retries.", required = true, example = "password-reset-1")
+            @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @Valid @RequestBody PasswordResetRequestDto request
+    ) {
+        String tokenFingerprint = hash(request.getToken());
+        String passwordFingerprint = hash(request.getNewPassword());
+        String requestHash = hash("password-reset|" + tokenFingerprint + "|" + passwordFingerprint);
+        Instant start = Instant.now();
+        return processIdempotentResponse(
+                start,
+                "auth.password.reset",
+                "/auth/password/reset",
+                idempotencyKey,
+                requestHash,
+                LogoutResponseDto.class,
+                () -> {
+                    credentialRecoveryService.resetPassword(request.getToken(), request.getNewPassword());
+                    return ResponseEntity.ok(new LogoutResponseDto("Password reset successful"));
+                }
+        );
     }
 
-    @PostMapping("/mfa/recovery/start")
+    @PostMapping("/password/change")
     @Operation(
-            summary = "Start MFA recovery",
-            description = "Creates a short-lived MFA recovery token (hashed in DB) and sends it via MessagingClient " +
-                    "using the requested channel. Always returns neutral 202."
+            summary = "Change password",
+            description = "Changes the password for an authenticated credential. Requires a valid Bearer access token."
     )
     @ApiResponses({
             @ApiResponse(
                     responseCode = "202",
-                    description = "Request accepted (neutral response).",
+                    description = "Password change accepted.",
                     content = @Content(
                             mediaType = "application/json",
                             schema = @Schema(implementation = AcceptedResponseDto.class),
-                            examples = @ExampleObject(value = "{\"message\":\"If recovery is available, instructions were sent.\"}")
+                            examples = @ExampleObject(value = "{\"message\":\"Password changed successfully\"}")
                     )
             ),
             @ApiResponse(
                     responseCode = "400",
-                    description = "Validation error.",
+                    description = "Validation or request format error.",
                     content = @Content(
                             mediaType = "application/json",
                             schema = @Schema(implementation = ApiErrorDto.class),
-                            examples = @ExampleObject(value = "{\"timestamp\":\"2026-02-18T12:34:56Z\",\"status\":400,\"code\":\"VALIDATION_ERROR\",\"message\":\"Request validation failed\",\"path\":\"/api/v1/auth/mfa/recovery/start\"}")
-                    )
-            )
-    })
-    public ResponseEntity<AcceptedResponseDto> mfaRecoveryStart(@Valid @RequestBody MfaRecoveryStartRequestDto request) {
-        credentialRecoveryService.startMfaRecovery(request.getEmail(), request.getChannel());
-        return ResponseEntity.accepted()
-                .body(new AcceptedResponseDto("If recovery is available, instructions were sent."));
-    }
-
-    @PostMapping("/mfa/recovery/confirm")
-    @Operation(
-            summary = "Confirm MFA recovery",
-            description = "Consumes a valid MFA recovery token and disables current MFA secret to allow secure re-enrollment."
-    )
-    @ApiResponses({
-            @ApiResponse(
-                    responseCode = "200",
-                    description = "MFA recovery confirmed.",
-                    content = @Content(
-                            mediaType = "application/json",
-                            schema = @Schema(implementation = LogoutResponseDto.class),
-                            examples = @ExampleObject(value = "{\"message\":\"MFA recovery confirmed\"}")
+                            examples = @ExampleObject(value = "{\"timestamp\":\"2026-02-18T12:34:56Z\",\"status\":400,\"code\":\"VALIDATION_ERROR\",\"message\":\"Request validation failed\",\"path\":\"/api/v1/auth/password/change\"}")
                     )
             ),
             @ApiResponse(
-                    responseCode = "400",
-                    description = "Invalid/expired token.",
+                    responseCode = "401",
+                    description = "Missing or invalid authorization token.",
                     content = @Content(
                             mediaType = "application/json",
                             schema = @Schema(implementation = ApiErrorDto.class),
-                            examples = @ExampleObject(value = "{\"timestamp\":\"2026-02-18T12:34:56Z\",\"status\":400,\"code\":\"TOKEN_INVALID\",\"message\":\"Recovery token is expired or already consumed\",\"path\":\"/api/v1/auth/mfa/recovery/confirm\"}")
+                            examples = @ExampleObject(value = "{\"timestamp\":\"2026-02-18T12:34:56Z\",\"status\":401,\"code\":\"INVALID_CREDENTIALS\",\"message\":\"Invalid credentials\",\"path\":\"/api/v1/auth/password/change\"}")
                     )
             )
     })
-    public ResponseEntity<LogoutResponseDto> mfaRecoveryConfirm(@Valid @RequestBody MfaRecoveryConfirmRequestDto request) {
-        credentialRecoveryService.confirmMfaRecovery(request.getToken());
-        return ResponseEntity.ok(new LogoutResponseDto("MFA recovery confirmed"));
+    public ResponseEntity<AcceptedResponseDto> passwordChange(
+            @Valid @RequestBody PasswordChangeRequestDto request,
+            HttpServletRequest httpRequest
+    ) {
+        Instant start = Instant.now();
+        try {
+            long credentialId = credentialIdFromAccessToken(httpRequest);
+            credentialRecoveryService.changePassword(credentialId, request.getCurrentPassword(), request.getNewPassword());
+            ResponseEntity<AcceptedResponseDto> response = ResponseEntity.accepted().body(new AcceptedResponseDto("Password changed successfully"));
+            logAuthEvent(start, "auth.password.change", "/auth/password/change", HttpStatus.ACCEPTED, "SUCCESS", null, null, null, null)
+                    .info("Password change completed");
+            return response;
+        } catch (AppException ex) {
+            logAuthEvent(start, "auth.password.change", "/auth/password/change", ex.getStatus(), "FAILURE", null, null, null, ex.getErrorCode())
+                    .warn("Password change failed");
+            throw ex;
+        } catch (RuntimeException ex) {
+            logAuthEvent(start, "auth.password.change", "/auth/password/change", HttpStatus.INTERNAL_SERVER_ERROR, "FAILURE", null, null, null, null)
+                    .error("Password change failed unexpectedly", ex);
+            throw ex;
+        }
     }
 
     private AuthCredential loadCredential(Long credentialId) {
@@ -666,24 +748,36 @@ public class AuthController {
         loginTransactions.entrySet().removeIf(e -> e.getValue().createdAt().plus(LOGIN_TRANSACTION_TTL).isBefore(now));
     }
 
-    private ResponseCookie buildRefreshCookie(String refreshToken, SessionPolicy sessionPolicy) {
+    private ResponseCookie buildRefreshCookie(String refreshToken, SessionPolicy sessionPolicy, String contextPath) {
+        Instant now = Instant.now();
         return ResponseCookie.from(REFRESH_COOKIE_NAME, refreshToken)
                 .httpOnly(true)
                 .secure(false)
-                .path("/api/v1/auth")
+                .path(resolveCookiePath(contextPath))
                 .sameSite("Strict")
-                .maxAge(Duration.between(Instant.now(), calculateSessionExpiry(sessionPolicy, Instant.now())))
+                .maxAge(Duration.between(now, calculateSessionExpiry(sessionPolicy, now)))
                 .build();
     }
 
-    private ResponseCookie clearRefreshCookie() {
+    private ResponseCookie clearRefreshCookie(String contextPath) {
         return ResponseCookie.from(REFRESH_COOKIE_NAME, "")
                 .httpOnly(true)
                 .secure(false)
-                .path("/api/v1/auth")
+                .path(resolveCookiePath(contextPath))
                 .sameSite("Strict")
                 .maxAge(Duration.ZERO)
                 .build();
+    }
+
+    private String resolveCookiePath(String contextPath) {
+        String normalized = contextPath == null ? "" : contextPath.trim();
+        if (normalized.equals("/")) {
+            normalized = "";
+        }
+        if (!normalized.isBlank() && normalized.endsWith("/")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized + AUTH_COOKIE_BASE_PATH;
     }
 
     private Instant calculateSessionExpiry(SessionPolicy policy, Instant now) {
@@ -691,6 +785,33 @@ public class AuthController {
             return now.plus(90, ChronoUnit.DAYS);
         }
         return now.plus(24, ChronoUnit.HOURS);
+    }
+
+    private String normalizeTenantHeader(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        return trimmed.isBlank() ? null : trimmed;
+    }
+
+    private String resolveTenantId(String headerValue) {
+        String normalized = normalizeTenantHeader(headerValue);
+        return normalized != null ? normalized : defaultTenantId;
+    }
+
+    private void ensureTenantMatchesHeader(String headerValue, RefreshSession session) {
+        if (headerValue == null) {
+            return;
+        }
+        if (!headerValue.equals(session.getTenantId())) {
+            throw new AppException(HttpStatus.FORBIDDEN, ErrorCode.TENANT_MISMATCH, "Tenant mismatch between header and session");
+        }
+    }
+
+    private String tenantForSession(RefreshSession session) {
+        String tenantId = session.getTenantId();
+        return (tenantId == null || tenantId.isBlank()) ? defaultTenantId : tenantId;
     }
 
     private Optional<String> readCookie(HttpServletRequest request, String cookieName) {
@@ -710,18 +831,87 @@ public class AuthController {
         return value == null ? "n/a" : value;
     }
 
+    private StructuredLogBuilder logAuthEvent(Instant start,
+                                               String eventName,
+                                               String requestPath,
+                                               HttpStatus status,
+                                               String outcome,
+                                               String idempotencyKey,
+                                               String tenantId,
+                                               String loginTransactionId,
+                                               ErrorCode errorCode) {
+        Duration duration = Duration.between(start, Instant.now());
+        StructuredLogBuilder builder = StructuredLogBuilder.forLogger(log)
+                .event(eventName)
+                .targetService("auth-service")
+                .requestPath(requestPath)
+                .httpMethod("POST")
+                .httpStatus(status != null ? status.value() : HttpStatus.OK.value())
+                .duration(duration)
+                .outcome(outcome)
+                .correlationId(correlationId())
+                .field("idempotencyKey", idempotencyKey)
+                .field("tenantId", tenantId)
+                .field("loginTransactionId", loginTransactionId);
+        if (errorCode != null) {
+            builder.errorCode(errorCode.name());
+        }
+        return builder;
+    }
+
+    private HttpStatus toHttpStatus(HttpStatusCode statusCode) {
+        if (statusCode == null) {
+            return HttpStatus.OK;
+        }
+        HttpStatus resolved = HttpStatus.resolve(statusCode.value());
+        return resolved != null ? resolved : HttpStatus.valueOf(statusCode.value());
+    }
+
     private void ensureSamePayload(IdempotencyRecord record, String requestHash) {
         if (!Objects.equals(record.getRequestHash(), requestHash)) {
             throw new AppException(CONFLICT, ErrorCode.IDEMPOTENCY_CONFLICT, "Idempotency-Key already used with a different payload");
         }
     }
 
-    private void verifyInternalApiKey(String headerValue) {
-        if (internalApiKey == null || internalApiKey.isBlank()) {
-            return;
-        }
-        if (!Objects.equals(internalApiKey, headerValue)) {
-            throw new AppException(UNAUTHORIZED, ErrorCode.INTERNAL_API_KEY_INVALID, "Invalid internal API key");
+    private <T> ResponseEntity<T> processIdempotentResponse(
+            Instant start,
+            String eventName,
+            String requestPath,
+            String idempotencyKey,
+            String requestHash,
+            Class<T> responseClass,
+            Supplier<ResponseEntity<T>> action
+    ) {
+        try {
+            Optional<IdempotencyRecord> existing = idempotencyRepository.findByIdempotencyKey(idempotencyKey);
+            if (existing.isPresent()) {
+                IdempotencyRecord record = existing.get();
+                ensureSamePayload(record, requestHash);
+                T body = null;
+                if (record.getResponseBody() != null && responseClass != null) {
+                    body = fromJson(record.getResponseBody(), responseClass);
+                }
+                HttpStatus replayStatus = record.getResponseStatus() == null ? HttpStatus.OK : HttpStatus.valueOf(record.getResponseStatus());
+                logAuthEvent(start, eventName, requestPath, replayStatus, "REPLAY", idempotencyKey, null, null, null)
+                        .info("Idempotent action replayed");
+                return ResponseEntity.status(replayStatus).body(body);
+            }
+
+            ResponseEntity<T> response = action.get();
+            upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash,
+                    response.getStatusCodeValue(), toJson(response.getBody()));
+            HttpStatus successStatus = toHttpStatus(response.getStatusCode());
+            logAuthEvent(start, eventName, requestPath, successStatus, "SUCCESS", idempotencyKey, null, null, null)
+                    .info("Idempotent action completed");
+            return response;
+        } catch (AppException ex) {
+            logAuthEvent(start, eventName, requestPath, ex.getStatus(), "FAILURE", idempotencyKey, null, null, ex.getErrorCode())
+                    .warn("Idempotent action failed");
+            throw ex;
+        } catch (RuntimeException ex) {
+            logAuthEvent(start, eventName, requestPath, HttpStatus.INTERNAL_SERVER_ERROR, "FAILURE", idempotencyKey, null, null, null)
+                    .error("Idempotent action failed unexpectedly", ex);
+            throw ex;
         }
     }
 
@@ -765,6 +955,24 @@ public class AuthController {
             return sb.toString();
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 not available", e);
+        }
+    }
+
+    private long credentialIdFromAccessToken(HttpServletRequest request) {
+        String headerValue = request.getHeader(HttpHeaders.AUTHORIZATION);
+        if (headerValue == null || !headerValue.startsWith(AUTHORIZATION_BEARER_PREFIX)) {
+            throw new AppException(UNAUTHORIZED, ErrorCode.INVALID_CREDENTIALS, "Missing or invalid Authorization header");
+        }
+        String token = headerValue.substring(AUTHORIZATION_BEARER_PREFIX.length()).trim();
+        if (token.isBlank()) {
+            throw new AppException(UNAUTHORIZED, ErrorCode.INVALID_CREDENTIALS, "Missing bearer token");
+        }
+
+        JWTClaimsSet claims = jwtTokenService.validateAccessToken(token);
+        try {
+            return Long.parseLong(claims.getSubject());
+        } catch (NumberFormatException e) {
+            throw new AppException(UNAUTHORIZED, ErrorCode.INVALID_CREDENTIALS, "Invalid credential subject in access token");
         }
     }
 
@@ -841,7 +1049,7 @@ public class AuthController {
                 .toList();
     }
 
-    private record PendingLoginTransaction(Long credentialId, Instant createdAt) {
+    private record PendingLoginTransaction(Long credentialId, Instant createdAt, String tenantId) {
     }
 
     private static class MfaVerifyReplayPayload {

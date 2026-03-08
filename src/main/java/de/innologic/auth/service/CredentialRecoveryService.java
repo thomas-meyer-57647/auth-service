@@ -13,6 +13,10 @@ import de.innologic.auth.domain.repository.PasswordResetTokenRepository;
 import de.innologic.auth.messaging.MessagingClient;
 import de.innologic.auth.web.error.AppException;
 import de.innologic.auth.web.error.ErrorCode;
+import de.innologic.auth.web.filter.CorrelationIdFilter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -32,6 +36,8 @@ import static org.springframework.http.HttpStatus.BAD_REQUEST;
 @Service
 public class CredentialRecoveryService {
 
+    private static final Logger log = LoggerFactory.getLogger(CredentialRecoveryService.class);
+
     private final CredentialRepository credentialRepository;
     private final MfaConfigRepository mfaRepository;
     private final PasswordResetTokenRepository passwordResetTokenRepository;
@@ -41,6 +47,8 @@ public class CredentialRecoveryService {
     private final PasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
     private final Duration passwordResetTtl;
     private final Duration mfaRecoveryTtl;
+    private final boolean smsPasswordResetEnabled;
+    private final boolean mfaRecoverySmsEnabled;
 
     public CredentialRecoveryService(
             CredentialRepository credentialRepository,
@@ -50,7 +58,9 @@ public class CredentialRecoveryService {
             MessagingClient messagingClient,
             SessionService sessionService,
             @Value("${auth.password-reset.ttl:PT15M}") Duration passwordResetTtl,
-            @Value("${auth.mfa-recovery.ttl:PT15M}") Duration mfaRecoveryTtl
+            @Value("${auth.mfa-recovery.ttl:PT15M}") Duration mfaRecoveryTtl,
+            @Value("${auth.password-reset.sms-enabled:false}") boolean smsPasswordResetEnabled,
+            @Value("${auth.mfa-recovery.sms-enabled:false}") boolean mfaRecoverySmsEnabled
     ) {
         this.credentialRepository = credentialRepository;
         this.mfaRepository = mfaRepository;
@@ -60,11 +70,15 @@ public class CredentialRecoveryService {
         this.sessionService = sessionService;
         this.passwordResetTtl = passwordResetTtl;
         this.mfaRecoveryTtl = mfaRecoveryTtl;
+        this.smsPasswordResetEnabled = smsPasswordResetEnabled;
+        this.mfaRecoverySmsEnabled = mfaRecoverySmsEnabled;
     }
 
-    public void initiatePasswordForgot(String email) {
+    public void initiatePasswordForgot(String email, RecoveryChannel requestedChannel) {
+        log.info("Initiating password forgot for email={} correlationId={}", email, correlationId());
         Optional<AuthCredential> credentialOpt = credentialRepository.findByLoginEmail(email);
         if (credentialOpt.isEmpty()) {
+            log.info("No credential found for email={} correlationId={}", email, correlationId());
             return;
         }
 
@@ -78,10 +92,14 @@ public class CredentialRecoveryService {
         token.setExpiresAt(Instant.now().plus(passwordResetTtl));
         passwordResetTokenRepository.save(token);
 
-        messagingClient.sendPasswordReset(credential.getLoginEmail(), rawToken);
+        RecoveryChannel channel = resolvePasswordResetChannel(requestedChannel);
+        messagingClient.sendPasswordReset(credential.getLoginEmail(), channel, rawToken);
+        log.info("Password reset token dispatched for email={} channel={} correlationId={}",
+                email, channel, correlationId());
     }
 
     public void resetPassword(String rawToken, String newPassword) {
+        log.info("Resetting password via token correlationId={}", correlationId());
         PasswordResetToken token = passwordResetTokenRepository.findByTokenHash(hash(rawToken))
                 .orElseThrow(() -> new AppException(BAD_REQUEST, ErrorCode.TOKEN_INVALID, "Invalid reset token"));
 
@@ -97,11 +115,40 @@ public class CredentialRecoveryService {
 
         token.setUsedAt(Instant.now());
         passwordResetTokenRepository.save(token);
+        log.info("Password reset completed for credentialId={} correlationId={}",
+                credential.getId(), correlationId());
+    }
+
+    public void changePassword(Long credentialId, String currentPassword, String newPassword) {
+        log.info("Changing password for credentialId={} correlationId={}", credentialId, correlationId());
+        AuthCredential credential = credentialRepository.findById(credentialId)
+                .orElseThrow(() -> new AppException(HttpStatus.UNAUTHORIZED, ErrorCode.INVALID_CREDENTIALS, "Credential not found"));
+        if (credential.getPasswordHash() == null || !passwordEncoder.matches(currentPassword, credential.getPasswordHash())) {
+            throw new AppException(HttpStatus.UNAUTHORIZED, ErrorCode.INVALID_CREDENTIALS, "Current password is invalid");
+        }
+        credential.setPasswordHash(passwordEncoder.encode(newPassword));
+        credential.setModifiedAt(Instant.now());
+        credentialRepository.save(credential);
+        sessionService.revokeAllSessionsForCredential(credential.getId());
+        log.info("Password change applied and sessions revoked for credentialId={} correlationId={}",
+                credentialId, correlationId());
+    }
+
+    private RecoveryChannel resolvePasswordResetChannel(RecoveryChannel requested) {
+        if (requested == null) {
+            return RecoveryChannel.EMAIL;
+        }
+        if (requested == RecoveryChannel.SMS && !smsPasswordResetEnabled) {
+            return RecoveryChannel.EMAIL;
+        }
+        return requested;
     }
 
     public void startMfaRecovery(String email, RecoveryChannel channel) {
+        log.info("Starting MFA recovery for email={} correlationId={}", email, correlationId());
         Optional<AuthCredential> credentialOpt = credentialRepository.findByLoginEmail(email);
         if (credentialOpt.isEmpty()) {
+            log.info("No credential for MFA recovery email={} correlationId={}", email, correlationId());
             return;
         }
 
@@ -119,10 +166,14 @@ public class CredentialRecoveryService {
         token.setExpiresAt(Instant.now().plus(mfaRecoveryTtl));
         mfaRecoveryTokenRepository.save(token);
 
-        messagingClient.sendMfaRecovery(credential.getLoginEmail(), channel, rawToken);
+        RecoveryChannel deliveryChannel = resolveMfaRecoveryChannel(channel);
+        messagingClient.sendMfaRecovery(credential.getLoginEmail(), deliveryChannel, rawToken);
+        log.info("MFA recovery token sent for email={} channel={} correlationId={}",
+                email, deliveryChannel, correlationId());
     }
 
     public void confirmMfaRecovery(String rawToken) {
+        log.info("Confirming MFA recovery token correlationId={}", correlationId());
         MfaRecoveryToken token = mfaRecoveryTokenRepository.findByTokenHash(hash(rawToken))
                 .orElseThrow(() -> new AppException(BAD_REQUEST, ErrorCode.TOKEN_INVALID, "Invalid recovery token"));
 
@@ -145,6 +196,8 @@ public class CredentialRecoveryService {
 
         token.setConsumedAt(Instant.now());
         mfaRecoveryTokenRepository.save(token);
+        log.info("MFA recovery confirmed for credentialId={} correlationId={}",
+                credential.getId(), correlationId());
     }
 
     private String generateOpaqueToken() {
@@ -166,5 +219,20 @@ public class CredentialRecoveryService {
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 not available", e);
         }
+    }
+
+    private String correlationId() {
+        String value = MDC.get(CorrelationIdFilter.MDC_KEY);
+        return value == null ? "n/a" : value;
+    }
+
+    private RecoveryChannel resolveMfaRecoveryChannel(RecoveryChannel requested) {
+        if (requested == null) {
+            return RecoveryChannel.EMAIL;
+        }
+        if (requested == RecoveryChannel.SMS && !mfaRecoverySmsEnabled) {
+            return RecoveryChannel.EMAIL;
+        }
+        return requested;
     }
 }

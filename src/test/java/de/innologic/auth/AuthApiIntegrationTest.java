@@ -26,13 +26,20 @@ import de.innologic.auth.outbound.CompanyServiceClient;
 import de.innologic.auth.outbound.IamServiceClient;
 import de.innologic.auth.outbound.UserServiceClient;
 import de.innologic.auth.security.jwt.JwtTokenService;
+import de.innologic.auth.service.RateLimiterService;
 import de.innologic.auth.social.FacebookSocialProviderClient;
 import de.innologic.auth.social.GoogleSocialProviderClient;
 import de.innologic.auth.social.SocialUserInfo;
 import de.innologic.auth.web.error.AppException;
 import de.innologic.auth.web.error.ErrorCode;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import de.innologic.auth.web.AuthController;
+import de.innologic.auth.web.RegistrationController;
 import de.innologic.auth.web.filter.CorrelationIdFilter;
 import jakarta.servlet.http.Cookie;
+import org.slf4j.LoggerFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -48,11 +55,14 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.test.web.servlet.ResultActions;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
+import java.util.UUID;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -64,6 +74,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -74,12 +85,16 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class AuthApiIntegrationTest {
 
     private static final String BASE = "/auth";
+    private static final String MFA_RECOVERY_BASE = "/mfa/recovery";
     private static final BCryptPasswordEncoder ENCODER = new BCryptPasswordEncoder();
     private static final String INTERNAL_API_KEY_HEADER = "X-Internal-Api-Key";
     private static final String INTERNAL_API_KEY_VALUE = "internal-test-key";
+    private static final String INTERNAL_TOKENS_SERVICE = "/internal/tokens/service";
 
     @Autowired
     private MockMvc mockMvc;
+
+    private ListAppender<ILoggingEvent> authLogAppender;
 
     @Autowired
     private ObjectMapper objectMapper;
@@ -114,6 +129,9 @@ class AuthApiIntegrationTest {
     @Autowired
     private VerificationTokenRepository verificationTokenRepository;
 
+    @Autowired
+    private RateLimiterService rateLimiterService;
+
     @MockitoBean
     private MessagingClient messagingClient;
 
@@ -143,17 +161,21 @@ class AuthApiIntegrationTest {
         idempotencyRepository.deleteAll();
         identityRepository.deleteAll();
         credentialRepository.deleteAll();
+        rateLimiterService.reset();
         when(googleSocialProviderClient.getProvider()).thenReturn(Provider.GOOGLE);
         when(facebookSocialProviderClient.getProvider()).thenReturn(Provider.FACEBOOK);
+        configureAuthLogging();
     }
 
     @Test
     void loginMfaRefreshLogout_happyPath() throws Exception {
         AuthCredential credential = createCredential("user@example.com", "P@ssw0rd!");
         createMfa(credential, "JBSWY3DPEHPK3PXP");
+        String tenantId = "tenant-42";
 
         MvcResult loginResult = mockMvc.perform(post(BASE + "/login")
                         .header("Idempotency-Key", "idem-login-1")
+                        .header("X-Tenant-Id", tenantId)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"email\":\"user@example.com\",\"password\":\"P@ssw0rd!\"}"))
                 .andExpect(status().isOk())
@@ -177,7 +199,7 @@ class AuthApiIntegrationTest {
         JWTClaimsSet accessClaims = accessJwt.getJWTClaimsSet();
         assertThat(accessClaims.getStringClaim("subject_type")).isEqualTo("USER");
         assertThat(accessClaims.getStringListClaim("scp")).contains("openid", "profile");
-        assertThat(accessClaims.getStringClaim("tenant_id")).isNotBlank();
+        assertThat(accessClaims.getStringClaim("tenant_id")).isEqualTo(tenantId);
         assertThat(accessClaims.getAudience()).contains("auth-api");
         assertThat(accessClaims.getIssuer()).isNotBlank();
         assertThat(accessClaims.getSubject()).isNotBlank();
@@ -189,6 +211,7 @@ class AuthApiIntegrationTest {
         assertThat(refreshCookie).isNotBlank();
 
         MvcResult refreshResult = mockMvc.perform(post(BASE + "/refresh")
+                        .header("X-Tenant-Id", tenantId)
                         .cookie(new Cookie("AUTH_REFRESH", refreshCookie)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.accessToken").exists())
@@ -197,6 +220,10 @@ class AuthApiIntegrationTest {
         String rotatedRefresh = extractCookieValue(refreshResult.getResponse().getHeader(HttpHeaders.SET_COOKIE), "AUTH_REFRESH");
         assertThat(rotatedRefresh).isNotBlank();
         assertThat(rotatedRefresh).isNotEqualTo(refreshCookie);
+
+        String rotatedAccessToken = json(refreshResult).get("accessToken").asText();
+        SignedJWT rotatedJwt = SignedJWT.parse(rotatedAccessToken);
+        assertThat(rotatedJwt.getJWTClaimsSet().getStringClaim("tenant_id")).isEqualTo(tenantId);
 
         mockMvc.perform(post(BASE + "/logout")
                         .cookie(new Cookie("AUTH_REFRESH", rotatedRefresh)))
@@ -207,19 +234,147 @@ class AuthApiIntegrationTest {
     }
 
     @Test
+    void rateLimitLoginWithinLimitAllowsMultipleRequests() throws Exception {
+        AuthCredential credential = createCredential("rl-login@example.com", "Pass12345!");
+        createMfa(credential, "JBSWY3DPEHPK3PXP");
+        String tenantId = "tenant-rate-limit";
+
+        loginRequest(tenantId, "rl-login-1", credential.getLoginEmail(), "Pass12345!")
+                .andExpect(status().isOk());
+        loginRequest(tenantId, "rl-login-2", credential.getLoginEmail(), "Pass12345!")
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void rateLimitLoginExceedLimitReturns429() throws Exception {
+        AuthCredential credential = createCredential("rl-login-exceed@example.com", "Pass12345!");
+        createMfa(credential, "JBSWY3DPEHPK3PXP");
+        String tenantId = "tenant-rate-limit";
+
+        loginRequest(tenantId, "rl-login-exceed-1", credential.getLoginEmail(), "Pass12345!")
+                .andExpect(status().isOk());
+        loginRequest(tenantId, "rl-login-exceed-2", credential.getLoginEmail(), "Pass12345!")
+                .andExpect(status().isOk());
+        loginRequest(tenantId, "rl-login-exceed-3", credential.getLoginEmail(), "Pass12345!")
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.errorCode").value("RATE_LIMITED"));
+    }
+
+    @Test
+    void rateLimitPasswordForgotUsesIndependentBucket() throws Exception {
+        MockHttpServletRequestBuilder forgot1 = post(BASE + "/password/forgot")
+                .header("Idempotency-Key", "rl-forgot-1")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"email\":\"rate-limit-forgot@example.com\"}")
+                .with(request -> {
+                    request.setRemoteAddr("127.0.0.1");
+                    return request;
+                });
+        mockMvc.perform(forgot1)
+                .andExpect(status().isAccepted());
+
+        MockHttpServletRequestBuilder forgot2 = post(BASE + "/password/forgot")
+                .header("Idempotency-Key", "rl-forgot-2")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"email\":\"rate-limit-forgot@example.com\"}")
+                .with(request -> {
+                    request.setRemoteAddr("127.0.0.1");
+                    return request;
+                });
+        mockMvc.perform(forgot2)
+                .andExpect(status().isAccepted());
+
+        MockHttpServletRequestBuilder forgot3 = post(BASE + "/password/forgot")
+                .header("Idempotency-Key", "rl-forgot-3")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"email\":\"rate-limit-forgot@example.com\"}")
+                .with(request -> {
+                    request.setRemoteAddr("127.0.0.1");
+                    return request;
+                });
+        mockMvc.perform(forgot3)
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.errorCode").value("RATE_LIMITED"));
+    }
+
+    @Test
+    void rateLimitSocialGoogleAppliesSeparateThreshold() throws Exception {
+        SocialUserInfo googleUser = new SocialUserInfo("rl-google", "limittest@example.com");
+        when(googleSocialProviderClient.fetchUserInfo("rl-google-token")).thenReturn(googleUser);
+
+        MockHttpServletRequestBuilder socialGoogle1 = post("/registration/social/google")
+                .header("Idempotency-Key", "rl-social-google-1")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(socialRegistrationPayload("rl-google-token"))
+                .with(request -> {
+                    request.setRemoteAddr("127.0.0.1");
+                    return request;
+                });
+        mockMvc.perform(socialGoogle1)
+                .andExpect(status().isCreated());
+
+        MockHttpServletRequestBuilder socialGoogle2 = post("/registration/social/google")
+                .header("Idempotency-Key", "rl-social-google-2")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(socialRegistrationPayload("rl-google-token"))
+                .with(request -> {
+                    request.setRemoteAddr("127.0.0.1");
+                    return request;
+                });
+        mockMvc.perform(socialGoogle2)
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.errorCode").value("RATE_LIMITED"));
+    }
+
+    @Test
+    void loginWithInvalidCredentials_returns401InvalidCredentials() throws Exception {
+        createCredential("invalid@example.com", "Pass12345!");
+
+        mockMvc.perform(post(BASE + "/login")
+                        .header("Idempotency-Key", "idem-login-invalid")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"invalid@example.com\",\"password\":\"WrongPass!\"}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.errorCode").value("INVALID_CREDENTIALS"));
+    }
+
+    @Test
+    void loginIdempotencyConflict_returns409IdempotencyConflict() throws Exception {
+        AuthCredential credential = createCredential("idem-conflict@example.com", "Pass12345!");
+        String idempotencyKey = "idem-key-conflict";
+
+        mockMvc.perform(post(BASE + "/login")
+                        .header("Idempotency-Key", idempotencyKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"idem-conflict@example.com\",\"password\":\"Pass12345!\"}"))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(post(BASE + "/login")
+                        .header("Idempotency-Key", idempotencyKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"idem-conflict@example.com\",\"password\":\"Different!\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("IDEMPOTENCY_CONFLICT"));
+    }
+
+    @Test
     void forgotThenResetPassword_happyPath() throws Exception {
         createCredential("reset@example.com", "OldPass123!");
 
         mockMvc.perform(post(BASE + "/password/forgot")
+                        .header("Idempotency-Key", "idem-password-forgot-1")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"email\":\"reset@example.com\"}"))
                 .andExpect(status().isAccepted());
 
         ArgumentCaptor<String> resetTokenCaptor = ArgumentCaptor.forClass(String.class);
-        verify(messagingClient, times(1)).sendPasswordReset(anyString(), resetTokenCaptor.capture());
+        ArgumentCaptor<RecoveryChannel> channelCaptor = ArgumentCaptor.forClass(RecoveryChannel.class);
+        verify(messagingClient, times(1)).sendPasswordReset(anyString(), channelCaptor.capture(), resetTokenCaptor.capture());
+        assertThat(channelCaptor.getValue()).isEqualTo(RecoveryChannel.EMAIL);
         String rawToken = resetTokenCaptor.getValue();
 
         mockMvc.perform(post(BASE + "/password/reset")
+                        .header("Idempotency-Key", "idem-password-reset-1")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"token\":\"" + rawToken + "\",\"newPassword\":\"NewPass123!\"}"))
                 .andExpect(status().isOk())
@@ -234,11 +389,30 @@ class AuthApiIntegrationTest {
     }
 
     @Test
+    void passwordForgotIdempotencyConflict_returns409() throws Exception {
+        String idempotencyKey = "password-forgot-conflict";
+
+        mockMvc.perform(post(BASE + "/password/forgot")
+                        .header("Idempotency-Key", idempotencyKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"conflict1@example.com\"}"))
+                .andExpect(status().isAccepted());
+
+        mockMvc.perform(post(BASE + "/password/forgot")
+                        .header("Idempotency-Key", idempotencyKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"conflict2@example.com\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("IDEMPOTENCY_CONFLICT"));
+    }
+
+    @Test
     void mfaRecoveryStartConfirm_happyPath_setsReEnrollFlag() throws Exception {
         AuthCredential credential = createCredential("mfa@example.com", "Pass12345!");
         createMfa(credential, "JBSWY3DPEHPK3PXP");
 
-        mockMvc.perform(post(BASE + "/mfa/recovery/start")
+        mockMvc.perform(post(MFA_RECOVERY_BASE + "/start")
+                        .header("Idempotency-Key", "idem-mfa-recovery-start")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"email\":\"mfa@example.com\",\"channel\":\"EMAIL\"}"))
                 .andExpect(status().isAccepted());
@@ -246,7 +420,8 @@ class AuthApiIntegrationTest {
         ArgumentCaptor<String> recoveryToken = ArgumentCaptor.forClass(String.class);
         verify(messagingClient, times(1)).sendMfaRecovery(anyString(), any(RecoveryChannel.class), recoveryToken.capture());
 
-        mockMvc.perform(post(BASE + "/mfa/recovery/confirm")
+        mockMvc.perform(post(MFA_RECOVERY_BASE + "/confirm")
+                        .header("Idempotency-Key", "idem-mfa-recovery-confirm")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"token\":\"" + recoveryToken.getValue() + "\"}"))
                 .andExpect(status().isOk())
@@ -257,6 +432,16 @@ class AuthApiIntegrationTest {
         assertThat(updated.getStatus()).isEqualTo(UserStatus.PENDING_MFA_ENROLLMENT);
         assertThat(updatedMfa.isEnabled()).isFalse();
         assertThat(updatedMfa.getTotpSecretEncrypted()).isNull();
+    }
+
+    @Test
+    void mfaRecoveryConfirm_invalidToken_returnsBadRequest() throws Exception {
+        mockMvc.perform(post(MFA_RECOVERY_BASE + "/confirm")
+                        .header("Idempotency-Key", "idem-mfa-recovery-confirm-invalid")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"invalid-token\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("TOKEN_INVALID"));
     }
 
     @Test
@@ -294,10 +479,74 @@ class AuthApiIntegrationTest {
     }
 
     @Test
+    void mfaVerifyWithoutConfiguration_returns401MfaRequired() throws Exception {
+        createCredential("mfa-missing@example.com", "Pass12345!");
+
+        MvcResult login = mockMvc.perform(post(BASE + "/login")
+                        .header("Idempotency-Key", "idem-mfa-required-login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"mfa-missing@example.com\",\"password\":\"Pass12345!\"}"))
+                .andExpect(status().isOk())
+                .andReturn();
+
+        String tx = json(login).get("loginTransactionId").asText();
+
+        mockMvc.perform(post(BASE + "/mfa/verify")
+                        .header("Idempotency-Key", "idem-mfa-required-verify")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"loginTransactionId\":\"" + tx + "\",\"totpCode\":\"000000\",\"sessionPolicy\":\"HOURS_24\"}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.errorCode").value("MFA_REQUIRED"));
+    }
+
+    @Test
     void refreshWithoutCookie_returns401RefreshInvalid() throws Exception {
         mockMvc.perform(post(BASE + "/refresh"))
                 .andExpect(status().isUnauthorized())
                 .andExpect(jsonPath("$.errorCode").value("REFRESH_INVALID"));
+    }
+
+    @Test
+    void refreshWithInvalidCookie_returns401RefreshInvalid() throws Exception {
+        mockMvc.perform(post(BASE + "/refresh")
+                        .cookie(new Cookie("AUTH_REFRESH", "invalid-token")))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.errorCode").value("REFRESH_INVALID"));
+    }
+
+    @Test
+    void refreshWithTenantHeaderMismatch_returns403TenantMismatch() throws Exception {
+        AuthCredential credential = createCredential("tenant-mismatch@example.com", "Pass12345!");
+        createMfa(credential, "JBSWY3DPEHPK3PXP");
+        String tenantId = "tenant-alpha";
+        String otherTenant = "tenant-beta";
+
+        MvcResult loginResult = mockMvc.perform(post(BASE + "/login")
+                        .header("Idempotency-Key", "idem-tenant-1")
+                        .header("X-Tenant-Id", tenantId)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"tenant-mismatch@example.com\",\"password\":\"Pass12345!\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.loginTransactionId").exists())
+                .andReturn();
+
+        String loginTransactionId = json(loginResult).get("loginTransactionId").asText();
+        String totp = generateTotpNow("JBSWY3DPEHPK3PXP");
+
+        MvcResult mfaResult = mockMvc.perform(post(BASE + "/mfa/verify")
+                        .header("Idempotency-Key", "idem-tenant-2")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"loginTransactionId\":\"" + loginTransactionId + "\",\"totpCode\":\"" + totp + "\",\"sessionPolicy\":\"HOURS_24\"}"))
+                .andExpect(status().isOk())
+                .andReturn();
+
+        String refreshCookie = extractCookieValue(mfaResult.getResponse().getHeader(HttpHeaders.SET_COOKIE), "AUTH_REFRESH");
+
+        mockMvc.perform(post(BASE + "/refresh")
+                        .header("X-Tenant-Id", otherTenant)
+                        .cookie(new Cookie("AUTH_REFRESH", refreshCookie)))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.errorCode").value("TENANT_MISMATCH"));
     }
 
     @Test
@@ -313,10 +562,110 @@ class AuthApiIntegrationTest {
         passwordResetTokenRepository.save(token);
 
         mockMvc.perform(post(BASE + "/password/reset")
+                        .header("Idempotency-Key", "idem-password-reset-check")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"token\":\"" + raw + "\",\"newPassword\":\"NewPass123!\"}"))
                 .andExpect(status().isGone())
                 .andExpect(jsonPath("$.errorCode").value("TOKEN_EXPIRED"));
+    }
+
+    @Test
+    void resetWithInvalidToken_returns400TokenInvalid() throws Exception {
+        mockMvc.perform(post(BASE + "/password/reset")
+                        .header("Idempotency-Key", "idem-password-reset-invalid")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"prt_invalid\",\"newPassword\":\"NewPass123!\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("TOKEN_INVALID"));
+    }
+
+    @Test
+    void passwordResetIdempotencyConflict_returns409() throws Exception {
+        createCredential("conflict-reset@example.com", "OldPass123!");
+
+        mockMvc.perform(post(BASE + "/password/forgot")
+                        .header("Idempotency-Key", "password-reset-conflict-forgot")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"conflict-reset@example.com\"}"))
+                .andExpect(status().isAccepted());
+
+        ArgumentCaptor<String> resetTokenCaptor = ArgumentCaptor.forClass(String.class);
+        verify(messagingClient, times(1)).sendPasswordReset(anyString(), any(RecoveryChannel.class), resetTokenCaptor.capture());
+        String token = resetTokenCaptor.getValue();
+
+        String idempotencyKey = "password-reset-conflict";
+        mockMvc.perform(post(BASE + "/password/reset")
+                        .header("Idempotency-Key", idempotencyKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + token + "\",\"newPassword\":\"NewPass123!\"}"))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(post(BASE + "/password/reset")
+                        .header("Idempotency-Key", idempotencyKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + token + "\",\"newPassword\":\"OtherPass123!\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("IDEMPOTENCY_CONFLICT"));
+    }
+
+    @Test
+    void passwordChange_authenticated_success() throws Exception {
+        AuthCredential credential = createCredential("change@example.com", "Pass12345!");
+        createMfa(credential, "JBSWY3DPEHPK3PXP");
+
+        String remoteA = "127.0.0.10";
+        String remoteB = "127.0.0.11";
+
+        MvcResult login = mockMvc.perform(withRemoteAddress(post(BASE + "/login")
+                        .header("Idempotency-Key", "idem-login-change")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"change@example.com\",\"password\":\"Pass12345!\"}"), remoteA))
+                .andExpect(status().isOk())
+                .andReturn();
+
+        String loginTransactionId = json(login).get("loginTransactionId").asText();
+        String totp = generateTotpNow("JBSWY3DPEHPK3PXP");
+
+        MvcResult mfaResult = mockMvc.perform(withRemoteAddress(post(BASE + "/mfa/verify")
+                        .header("Idempotency-Key", "idem-mfa-change")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"loginTransactionId\":\"" + loginTransactionId + "\",\"totpCode\":\"" + totp + "\",\"sessionPolicy\":\"HOURS_24\"}"), remoteA))
+                .andExpect(status().isOk())
+                .andReturn();
+
+        String accessToken = json(mfaResult).get("accessToken").asText();
+
+        mockMvc.perform(withRemoteAddress(post(BASE + "/password/change")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"currentPassword\":\"Pass12345!\",\"newPassword\":\"Changed123!\"}"), remoteB))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.message").value("Password changed successfully"));
+
+        MvcResult loginAfterChange = mockMvc.perform(withRemoteAddress(post(BASE + "/login")
+                        .header("Idempotency-Key", "idem-login-change-recheck")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"change@example.com\",\"password\":\"Changed123!\"}"), remoteB))
+                .andExpect(status().isOk())
+                .andReturn();
+
+        String afterChangeTx = json(loginAfterChange).get("loginTransactionId").asText();
+        String newTotp = generateTotpNow("JBSWY3DPEHPK3PXP");
+
+        mockMvc.perform(withRemoteAddress(post(BASE + "/mfa/verify")
+                        .header("Idempotency-Key", "idem-mfa-change-recheck")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"loginTransactionId\":\"" + afterChangeTx + "\",\"totpCode\":\"" + newTotp + "\",\"sessionPolicy\":\"HOURS_24\"}"), remoteB))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void passwordChange_missingAuthorization_returns401InvalidCredentials() throws Exception {
+        mockMvc.perform(post(BASE + "/password/change")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"currentPassword\":\"Pass12345!\",\"newPassword\":\"Changed123!\"}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.errorCode").value("INVALID_CREDENTIALS"));
     }
 
     @Test
@@ -339,10 +688,11 @@ class AuthApiIntegrationTest {
 
     @Test
     void internalServiceToken_withValidApiKey_returnsServiceToken() throws Exception {
-        long ttl = jwtTokenService.getServiceTokenTtlSeconds();
-        String payload = "{\"serviceName\":\"auth-service\",\"tenantId\":\"tenant-1\",\"aud\":[\"company-service\"],\"scopes\":[\"company:create\"]}";
+        long ttl = 180;
+        String payload = "{\"serviceName\":\"auth-service\",\"tenantId\":\"tenant-1\",\"aud\":[\"company-service\"],\"scopes\":[\"company:create\"],\"ttlSeconds\":" + ttl + "}";
 
-        MvcResult result = mockMvc.perform(post(BASE + "/internal/service-token")
+        MvcResult result = mockMvc.perform(post(INTERNAL_TOKENS_SERVICE)
+                        .header("Idempotency-Key", "idem-service-token")
                         .header(INTERNAL_API_KEY_HEADER, INTERNAL_API_KEY_VALUE)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(payload))
@@ -362,10 +712,12 @@ class AuthApiIntegrationTest {
     }
 
     @Test
-    void internalServiceToken_missingApiKey_returns401() throws Exception {
-        String payload = "{\"serviceName\":\"auth-service\",\"tenantId\":\"tenant-1\",\"aud\":[\"company-service\"],\"scopes\":[\"company:create\"]}";
+    void internalServiceToken_invalidApiKey_returns401() throws Exception {
+        String payload = "{\"serviceName\":\"auth-service\",\"tenantId\":\"tenant-1\",\"aud\":[\"company-service\"],\"scopes\":[\"company:create\"],\"ttlSeconds\":120}";
 
-        mockMvc.perform(post(BASE + "/internal/service-token")
+        mockMvc.perform(post(INTERNAL_TOKENS_SERVICE)
+                        .header("Idempotency-Key", "idem-service-token-missing-key")
+                        .header(INTERNAL_API_KEY_HEADER, "wrong-key")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(payload))
                 .andExpect(status().isUnauthorized())
@@ -374,9 +726,10 @@ class AuthApiIntegrationTest {
 
     @Test
     void internalServiceToken_emptyScopes_returns400() throws Exception {
-        String payload = "{\"serviceName\":\"auth-service\",\"tenantId\":\"tenant-1\",\"aud\":[\"company-service\"],\"scopes\":[]}";
+        String payload = "{\"serviceName\":\"auth-service\",\"tenantId\":\"tenant-1\",\"aud\":[\"company-service\"],\"scopes\":[],\"ttlSeconds\":120}";
 
-        mockMvc.perform(post(BASE + "/internal/service-token")
+        mockMvc.perform(post(INTERNAL_TOKENS_SERVICE)
+                        .header("Idempotency-Key", "idem-service-token-scope")
                         .header(INTERNAL_API_KEY_HEADER, INTERNAL_API_KEY_VALUE)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(payload))
@@ -551,6 +904,7 @@ class AuthApiIntegrationTest {
         when(googleSocialProviderClient.fetchUserInfo("google-token")).thenReturn(googleUser);
 
         mockMvc.perform(post("/registration/social/google")
+                        .header("Idempotency-Key", "social-google-success")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(socialRegistrationPayload("google-token")))
                 .andExpect(status().isCreated())
@@ -567,6 +921,7 @@ class AuthApiIntegrationTest {
         when(googleSocialProviderClient.fetchUserInfo("google-login-token")).thenReturn(googleUser);
 
         mockMvc.perform(post("/registration/social/google")
+                        .header("Idempotency-Key", "social-google-login")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(socialRegistrationPayload("google-login-token")))
                 .andExpect(status().isCreated());
@@ -580,11 +935,23 @@ class AuthApiIntegrationTest {
     }
 
     @Test
+    void passwordForgotUnknownEmail_returnsAcceptedWithoutMessaging() throws Exception {
+        mockMvc.perform(post(BASE + "/password/forgot")
+                        .header("Idempotency-Key", "password-forgot-unknown")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"unknown@example.com\"}"))
+                .andExpect(status().isAccepted());
+
+        verify(messagingClient, never()).sendPasswordReset(anyString(), any(RecoveryChannel.class), anyString());
+    }
+
+    @Test
     void socialRegistrationGoogle_providerUnavailable_returns503() throws Exception {
         when(googleSocialProviderClient.fetchUserInfo("bad-token"))
                 .thenThrow(new AppException(HttpStatus.SERVICE_UNAVAILABLE, ErrorCode.SOCIAL_PROVIDER_UNAVAILABLE, "Google provider unavailable"));
 
         mockMvc.perform(post("/registration/social/google")
+                        .header("Idempotency-Key", "social-google-unavailable")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(socialRegistrationPayload("bad-token")))
                 .andExpect(status().isServiceUnavailable())
@@ -596,14 +963,19 @@ class AuthApiIntegrationTest {
         SocialUserInfo googleUser = new SocialUserInfo("google-dup", "dup@example.com");
         when(googleSocialProviderClient.fetchUserInfo("google-dup-token")).thenReturn(googleUser);
 
-        mockMvc.perform(post("/registration/social/google")
+        String remoteFirst = "127.0.0.50";
+        String remoteSecond = "127.0.0.51";
+
+        mockMvc.perform(withRemoteAddress(post("/registration/social/google")
+                        .header("Idempotency-Key", "social-google-dup-1")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(socialRegistrationPayload("google-dup-token")))
+                        .content(socialRegistrationPayload("google-dup-token")), remoteFirst))
                 .andExpect(status().isCreated());
 
-        mockMvc.perform(post("/registration/social/google")
+        mockMvc.perform(withRemoteAddress(post("/registration/social/google")
+                        .header("Idempotency-Key", "social-google-dup-2")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(socialRegistrationPayload("google-dup-token")))
+                        .content(socialRegistrationPayload("google-dup-token")), remoteSecond))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.errorCode").value("SOCIAL_IDENTITY_ALREADY_LINKED"));
     }
@@ -615,14 +987,215 @@ class AuthApiIntegrationTest {
         when(googleSocialProviderClient.fetchUserInfo("google-email-token")).thenReturn(googleUser);
 
         mockMvc.perform(post("/registration/social/google")
+                        .header("Idempotency-Key", "social-google-email-conflict")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(socialRegistrationPayload("google-email-token")))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.errorCode").value("EMAIL_ALREADY_USED_BY_OTHER_PROVIDER"));
     }
 
+    @Test
+    void socialRegistrationFacebook_successfulCreatesPendingProcess() throws Exception {
+        SocialUserInfo facebookUser = new SocialUserInfo("facebook-sub", "social-fb@example.com");
+        when(facebookSocialProviderClient.fetchUserInfo("facebook-token")).thenReturn(facebookUser);
+
+        mockMvc.perform(post("/registration/social/facebook")
+                        .header("Idempotency-Key", "social-facebook-success")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(socialRegistrationPayload("facebook-token")))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.registrationId").exists())
+                .andExpect(jsonPath("$.status").value("PENDING_EMAIL_VERIFICATION"));
+
+        assertThat(identityRepository.findByProviderAndProviderSubject(Provider.FACEBOOK, "facebook-sub")).isPresent();
+        assertThat(credentialRepository.findByLoginEmail("social-fb@example.com")).isPresent();
+    }
+
+    @Test
+    void socialRegistrationGoogle_replayReturnsStoredResponse() throws Exception {
+        SocialUserInfo googleUser = new SocialUserInfo("google-replay", "replay@example.com");
+        when(googleSocialProviderClient.fetchUserInfo("google-replay-token")).thenReturn(googleUser);
+
+        String key = "social-google-replay";
+
+        String remoteFirst = "127.0.0.30";
+        String remoteSecond = "127.0.0.31";
+
+        MvcResult first = mockMvc.perform(withRemoteAddress(post("/registration/social/google")
+                        .header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(socialRegistrationPayload("google-replay-token")), remoteFirst))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        String firstId = json(first).get("registrationId").asText();
+
+        MvcResult second = mockMvc.perform(withRemoteAddress(post("/registration/social/google")
+                        .header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(socialRegistrationPayload("google-replay-token")), remoteSecond))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        String secondId = json(second).get("registrationId").asText();
+        assertThat(secondId).isEqualTo(firstId);
+        assertThat(idempotencyRepository.findByIdempotencyKey(key)).isPresent();
+    }
+
+    @Test
+    void socialRegistrationGoogle_idempotencyConflictDifferentPayload() throws Exception {
+        SocialUserInfo googleUser = new SocialUserInfo("google-conflict", "conflict@example.com");
+        when(googleSocialProviderClient.fetchUserInfo("google-conflict-token")).thenReturn(googleUser);
+
+        String key = "social-google-different";
+
+        String remoteFirst = "127.0.0.40";
+        String remoteSecond = "127.0.0.41";
+
+        mockMvc.perform(withRemoteAddress(post("/registration/social/google")
+                        .header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(socialRegistrationPayload("google-conflict-token")), remoteFirst))
+                .andExpect(status().isCreated());
+
+        mockMvc.perform(withRemoteAddress(post("/registration/social/google")
+                        .header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(socialRegistrationPayload("google-conflict-token-alt")), remoteSecond))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("IDEMPOTENCY_CONFLICT"));
+    }
+
+    @Test
+    void socialRegistrationGoogle_missingIdempotencyKey_returnsBadRequest() throws Exception {
+        mockMvc.perform(post("/registration/social/google")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(socialRegistrationPayload("google-missing-key")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    void registrationStartLogsStructuredFields() throws Exception {
+        Logger registrationLogger = (Logger) LoggerFactory.getLogger(RegistrationController.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        registrationLogger.addAppender(appender);
+        try {
+            mockMvc.perform(post("/registration/start")
+                            .header("Idempotency-Key", "log-struct-1")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(registrationPayload("log-structured@example.com")))
+                    .andExpect(status().isCreated());
+        } finally {
+            registrationLogger.detachAppender(appender);
+        }
+
+        assertThat(appender.list)
+                .anyMatch(event -> event.getFormattedMessage().contains("eventName=registration.start")
+                        && event.getFormattedMessage().contains("targetService=auth-service")
+                        && event.getFormattedMessage().contains("outcome=SUCCESS"));
+    }
+
+    @Test
+    void supportDiagnosisReturnsMetricsForTenant() throws Exception {
+        mockMvc.perform(post("/registration/start")
+                        .header("Idempotency-Key", "support-start-data")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(registrationPayload("support-diagnosis@example.com")))
+                .andExpect(status().isCreated());
+
+        mockMvc.perform(get("/support/diagnosis")
+                        .header("X-Support-User-Id", "support-user")
+                        .header("X-Support-Role", "SUPPORT_AGENT")
+                        .header("X-Support-Purpose", "Check tenant health")
+                        .param("tenantId", "tenant-1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.resolvedTenantId").value("tenant-1"))
+                .andExpect(jsonPath("$.supportUserId").value("support-user"))
+                .andExpect(jsonPath("$.details.pendingRegistrations").value(1));
+    }
+
+    @Test
+    void supportDiagnosisWithoutCredentialsIsRejected() throws Exception {
+        mockMvc.perform(get("/support/diagnosis")
+                        .header("X-Support-Purpose", "Check tenant health")
+                        .param("tenantId", "tenant-1"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.errorCode").value("ACCESS_DENIED"));
+    }
+
+    @Test
+    void supportDiagnosisWithoutTenantContextIsRejected() throws Exception {
+        mockMvc.perform(get("/support/diagnosis")
+                        .header("X-Support-User-Id", "support-user")
+                        .header("X-Support-Role", "SUPPORT_AGENT")
+                        .header("X-Support-Purpose", "Diagnose"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    void loginStructuredLogIncludesMetadata() throws Exception {
+        authLogAppender.list.clear();
+        createCredential("logentry@example.com", "P@ssw0rd!");
+
+        mockMvc.perform(post(BASE + "/login")
+                        .header("Idempotency-Key", "log-structured-key")
+                        .header("X-Tenant-Id", "tenant-structured")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"logentry@example.com\",\"password\":\"P@ssw0rd!\"}"))
+                .andExpect(status().isOk());
+
+        assertThat(authLogAppender.list).anyMatch(event -> {
+            String message = event.getFormattedMessage();
+            return message.contains("eventName=auth.login.password")
+                    && message.contains("outcome=SUCCESS")
+                    && message.contains("idempotencyKey=log-structured-key")
+                    && message.contains("correlationId=");
+        });
+    }
+
+    @Test
+    void loginFailureLogsFailureOutcome() throws Exception {
+        authLogAppender.list.clear();
+        createCredential("fail@example.com", "P@ssw0rd!");
+
+        mockMvc.perform(post(BASE + "/login")
+                        .header("Idempotency-Key", "log-structured-fail")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"fail@example.com\",\"password\":\"WrongPass123!\"}"))
+                .andExpect(status().isUnauthorized());
+
+        assertThat(authLogAppender.list)
+                .anyMatch(event -> event.getFormattedMessage().contains("eventName=auth.login.password")
+                        && event.getFormattedMessage().contains("outcome=FAILURE")
+                        && event.getFormattedMessage().contains("errorCode=INVALID_CREDENTIALS"));
+    }
+
+    private ResultActions loginRequest(String tenantId, String idempotencyKey, String email, String password) throws Exception {
+        MockHttpServletRequestBuilder builder = post(BASE + "/login")
+                .header("Idempotency-Key", idempotencyKey)
+                .header("X-Tenant-Id", tenantId)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"email\":\"" + email + "\",\"password\":\"" + password + "\"}")
+                .with(request -> {
+                    request.setRemoteAddr("127.0.0.1");
+                    return request;
+                });
+        return mockMvc.perform(builder);
+    }
+
+    private MockHttpServletRequestBuilder withRemoteAddress(MockHttpServletRequestBuilder builder, String remoteAddr) {
+        return builder.with(request -> {
+            request.setRemoteAddr(remoteAddr);
+            return request;
+        });
+    }
+
     private AuthCredential createCredential(String email, String password) {
         AuthCredential credential = new AuthCredential();
+        credential.setUserId(UUID.randomUUID().toString());
         credential.setLoginEmail(email);
         credential.setPasswordHash(ENCODER.encode(password));
         credential.setStatus(UserStatus.ACTIVE);
@@ -709,6 +1282,16 @@ class AuthApiIntegrationTest {
             result[i] = out.get(i);
         }
         return result;
+    }
+
+    private void configureAuthLogging() {
+        Logger authLogger = (Logger) LoggerFactory.getLogger(AuthController.class);
+        if (authLogAppender != null) {
+            authLogger.detachAppender(authLogAppender);
+        }
+        authLogAppender = new ListAppender<>();
+        authLogAppender.start();
+        authLogger.addAppender(authLogAppender);
     }
 
     private String sha256(String input) {
@@ -975,3 +1558,7 @@ class AuthApiIntegrationTest {
                 .andExpect(jsonPath("$.errorCode").value("DOWNSTREAM_IAM_UNAVAILABLE"));
     }
 }
+
+
+
+

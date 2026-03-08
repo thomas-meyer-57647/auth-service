@@ -3,6 +3,7 @@ package de.innologic.auth.web.dto;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotEmpty;
+import jakarta.validation.constraints.Positive;
 
 import java.util.List;
 
@@ -24,6 +25,10 @@ public class ServiceTokenRequestDto {
     @Schema(description = "Scopes granted to the service token.", requiredMode = Schema.RequiredMode.REQUIRED)
     @NotEmpty
     private List<String> scopes;
+
+    @Schema(description = "Requested token lifetime in seconds.", example = "300")
+    @Positive
+    private Long ttlSeconds;
 
     public ServiceTokenRequestDto() {
     }
@@ -58,5 +63,13 @@ public class ServiceTokenRequestDto {
 
     public void setScopes(List<String> scopes) {
         this.scopes = scopes;
+    }
+
+    public Long getTtlSeconds() {
+        return ttlSeconds;
+    }
+
+    public void setTtlSeconds(Long ttlSeconds) {
+        this.ttlSeconds = ttlSeconds;
     }
 }

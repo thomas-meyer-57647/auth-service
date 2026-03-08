@@ -21,6 +21,7 @@ import de.innologic.auth.web.dto.SocialRegistrationRequestDto;
 import de.innologic.auth.web.error.ApiErrorDto;
 import de.innologic.auth.web.error.AppException;
 import de.innologic.auth.web.error.ErrorCode;
+import de.innologic.auth.logging.StructuredLogBuilder;
 import de.innologic.auth.web.filter.CorrelationIdFilter;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
@@ -100,6 +101,7 @@ public class RegistrationController {
             @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
             @Valid @RequestBody RegistrationStartRequestDto request
     ) {
+        Instant start = Instant.now();
         log.info("Handling registration start for email={} correlationId={}", request.getUserEmail(), correlationId());
         String requestHash = hash("registration:start|" + requestDigest(request));
         Optional<IdempotencyRecord> existing = idempotencyRepository.findByIdempotencyKey(idempotencyKey);
@@ -108,8 +110,10 @@ public class RegistrationController {
             ensureSamePayload(record, requestHash);
             if (record.getResponseBody() != null) {
                 log.info("Replaying stored registration start response for key={} correlationId={}", idempotencyKey, correlationId());
-                return ResponseEntity.status(record.getResponseStatus())
+                ResponseEntity<RegistrationStartResponseDto> responseEntity = ResponseEntity.status(record.getResponseStatus())
                         .body(fromJson(record.getResponseBody(), RegistrationStartResponseDto.class));
+                logRegistrationStart(start, HttpStatus.valueOf(record.getResponseStatus()), idempotencyKey, "REPLAY", true, request.getTenantId());
+                return responseEntity;
             }
         }
 
@@ -122,7 +126,9 @@ public class RegistrationController {
         );
 
         upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash, HttpStatus.CREATED.value(), toJson(response));
-        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+        ResponseEntity<RegistrationStartResponseDto> responseEntity = ResponseEntity.status(HttpStatus.CREATED).body(response);
+        logRegistrationStart(start, HttpStatus.CREATED, idempotencyKey, "SUCCESS", false, request.getTenantId());
+        return responseEntity;
     }
 
     @PostMapping("/social/google")
@@ -145,16 +151,35 @@ public class RegistrationController {
             ),
             @ApiResponse(
                     responseCode = "409",
-                    description = "Social identity already linked or e-mail already used.",
+                    description = "Social identity already linked, e-mail already used, or Idempotency-Key reused with a different payload.",
                     content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
             )
     })
     public ResponseEntity<RegistrationStartResponseDto> socialRegistrationGoogle(
+            @Parameter(description = "Idempotency key for safe retries.", required = true, example = "social-google-key")
+            @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
             @Valid @RequestBody SocialRegistrationRequestDto request
     ) {
-        log.info("Handling social registration via Google correlationId={}", correlationId());
+        Instant start = Instant.now();
+        String requestHash = hash("registration:social:google|" + socialRequestDigest(Provider.GOOGLE, request));
+        Optional<IdempotencyRecord> existing = idempotencyRepository.findByIdempotencyKey(idempotencyKey);
+        if (existing.isPresent()) {
+            IdempotencyRecord record = existing.get();
+            ensureSamePayload(record, requestHash);
+            if (record.getResponseBody() != null) {
+                HttpStatus replayStatus = record.getResponseStatus() == null ? HttpStatus.OK : HttpStatus.valueOf(record.getResponseStatus());
+                RegistrationStartResponseDto cached = fromJson(record.getResponseBody(), RegistrationStartResponseDto.class);
+                logSocialRegistration(start, replayStatus, Provider.GOOGLE, idempotencyKey, "REPLAY", true, request.getTenantId());
+                return ResponseEntity.status(replayStatus)
+                        .body(cached);
+            }
+        }
+
         RegistrationStartResponseDto response = socialAuthService.registerWithProvider(Provider.GOOGLE, request);
-        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+        upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash, HttpStatus.CREATED.value(), toJson(response));
+        ResponseEntity<RegistrationStartResponseDto> responseEntity = ResponseEntity.status(HttpStatus.CREATED).body(response);
+        logSocialRegistration(start, HttpStatus.CREATED, Provider.GOOGLE, idempotencyKey, "SUCCESS", false, request.getTenantId());
+        return responseEntity;
     }
 
     @PostMapping("/social/facebook")
@@ -177,16 +202,35 @@ public class RegistrationController {
             ),
             @ApiResponse(
                     responseCode = "409",
-                    description = "Social identity already linked or e-mail already used.",
+                    description = "Social identity already linked, e-mail already used, or Idempotency-Key reused with a different payload.",
                     content = @Content(mediaType = "application/json", schema = @Schema(implementation = ApiErrorDto.class))
             )
     })
     public ResponseEntity<RegistrationStartResponseDto> socialRegistrationFacebook(
+            @Parameter(description = "Idempotency key for safe retries.", required = true, example = "social-facebook-key")
+            @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
             @Valid @RequestBody SocialRegistrationRequestDto request
     ) {
-        log.info("Handling social registration via Facebook correlationId={}", correlationId());
+        Instant start = Instant.now();
+        String requestHash = hash("registration:social:facebook|" + socialRequestDigest(Provider.FACEBOOK, request));
+        Optional<IdempotencyRecord> existing = idempotencyRepository.findByIdempotencyKey(idempotencyKey);
+        if (existing.isPresent()) {
+            IdempotencyRecord record = existing.get();
+            ensureSamePayload(record, requestHash);
+            if (record.getResponseBody() != null) {
+                HttpStatus replayStatus = record.getResponseStatus() == null ? HttpStatus.OK : HttpStatus.valueOf(record.getResponseStatus());
+                RegistrationStartResponseDto cached = fromJson(record.getResponseBody(), RegistrationStartResponseDto.class);
+                logSocialRegistration(start, replayStatus, Provider.FACEBOOK, idempotencyKey, "REPLAY", true, request.getTenantId());
+                return ResponseEntity.status(replayStatus)
+                        .body(cached);
+            }
+        }
+
         RegistrationStartResponseDto response = socialAuthService.registerWithProvider(Provider.FACEBOOK, request);
-        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+        upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash, HttpStatus.CREATED.value(), toJson(response));
+        ResponseEntity<RegistrationStartResponseDto> responseEntity = ResponseEntity.status(HttpStatus.CREATED).body(response);
+        logSocialRegistration(start, HttpStatus.CREATED, Provider.FACEBOOK, idempotencyKey, "SUCCESS", false, request.getTenantId());
+        return responseEntity;
     }
 
     @PostMapping("/verify-email")
@@ -228,16 +272,18 @@ public class RegistrationController {
             @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
             @Valid @RequestBody RegistrationVerifyRequestDto request
     ) {
-        log.info("Handling registration verify for registrationId={} correlationId={}", request.getRegistrationId(), correlationId());
+        Instant start = Instant.now();
         String requestHash = hash("registration:verify|" + request.getRegistrationId() + "|" + request.getVerificationToken());
         Optional<IdempotencyRecord> existing = idempotencyRepository.findByIdempotencyKey(idempotencyKey);
         if (existing.isPresent()) {
             IdempotencyRecord record = existing.get();
             ensureSamePayload(record, requestHash);
             if (record.getResponseBody() != null) {
-                log.info("Replaying stored registration verify response for key={} correlationId={}", idempotencyKey, correlationId());
-                return ResponseEntity.status(record.getResponseStatus())
-                        .body(fromJson(record.getResponseBody(), RegistrationVerifyResponseDto.class));
+                HttpStatus replayStatus = record.getResponseStatus() == null ? HttpStatus.OK : HttpStatus.valueOf(record.getResponseStatus());
+                RegistrationVerifyResponseDto cached = fromJson(record.getResponseBody(), RegistrationVerifyResponseDto.class);
+                logRegistrationVerify(start, replayStatus, idempotencyKey, request.getRegistrationId(), "REPLAY", true);
+                return ResponseEntity.status(replayStatus)
+                        .body(cached);
             }
         }
 
@@ -249,7 +295,9 @@ public class RegistrationController {
         );
 
         upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash, HttpStatus.OK.value(), toJson(response));
-        return ResponseEntity.ok(response);
+        ResponseEntity<RegistrationVerifyResponseDto> responseEntity = ResponseEntity.ok(response);
+        logRegistrationVerify(start, HttpStatus.OK, idempotencyKey, request.getRegistrationId(), "SUCCESS", false);
+        return responseEntity;
     }
 
     @PostMapping("/mfa/totp/enroll")
@@ -276,16 +324,18 @@ public class RegistrationController {
             @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
             @Valid @RequestBody RegistrationMfaEnrollRequestDto request
     ) {
-        log.info("Handling MFA enrollment for registrationId={} correlationId={}", request.getRegistrationId(), correlationId());
+        Instant start = Instant.now();
         String requestHash = hash("registration:mfa:enroll|" + request.getRegistrationId());
         Optional<IdempotencyRecord> existing = idempotencyRepository.findByIdempotencyKey(idempotencyKey);
         if (existing.isPresent()) {
             IdempotencyRecord record = existing.get();
             ensureSamePayload(record, requestHash);
             if (record.getResponseBody() != null) {
-                log.info("Replaying stored MFA enrollment response for key={} correlationId={}", idempotencyKey, correlationId());
-                return ResponseEntity.status(record.getResponseStatus())
-                        .body(fromJson(record.getResponseBody(), RegistrationMfaEnrollResponseDto.class));
+                HttpStatus replayStatus = record.getResponseStatus() == null ? HttpStatus.OK : HttpStatus.valueOf(record.getResponseStatus());
+                RegistrationMfaEnrollResponseDto cached = fromJson(record.getResponseBody(), RegistrationMfaEnrollResponseDto.class);
+                logMfaEnroll(start, replayStatus, idempotencyKey, request.getRegistrationId(), "REPLAY", true);
+                return ResponseEntity.status(replayStatus)
+                        .body(cached);
             }
         }
 
@@ -298,7 +348,9 @@ public class RegistrationController {
         );
 
         upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash, HttpStatus.OK.value(), toJson(response));
-        return ResponseEntity.ok(response);
+        ResponseEntity<RegistrationMfaEnrollResponseDto> responseEntity = ResponseEntity.ok(response);
+        logMfaEnroll(start, HttpStatus.OK, idempotencyKey, request.getRegistrationId(), "SUCCESS", false);
+        return responseEntity;
     }
 
     @PostMapping("/mfa/totp/confirm")
@@ -325,16 +377,18 @@ public class RegistrationController {
             @NotBlank @RequestHeader("Idempotency-Key") String idempotencyKey,
             @Valid @RequestBody RegistrationMfaConfirmRequestDto request
     ) {
-        log.info("Handling MFA confirm for registrationId={} correlationId={}", request.getRegistrationId(), correlationId());
+        Instant start = Instant.now();
         String requestHash = hash("registration:mfa:confirm|" + request.getRegistrationId() + "|" + request.getTotpCode());
         Optional<IdempotencyRecord> existing = idempotencyRepository.findByIdempotencyKey(idempotencyKey);
         if (existing.isPresent()) {
             IdempotencyRecord record = existing.get();
             ensureSamePayload(record, requestHash);
             if (record.getResponseBody() != null) {
-                log.info("Replaying stored MFA confirm response for key={} correlationId={}", idempotencyKey, correlationId());
-                return ResponseEntity.status(record.getResponseStatus())
-                        .body(fromJson(record.getResponseBody(), RegistrationMfaConfirmResponseDto.class));
+                HttpStatus replayStatus = record.getResponseStatus() == null ? HttpStatus.OK : HttpStatus.valueOf(record.getResponseStatus());
+                RegistrationMfaConfirmResponseDto cached = fromJson(record.getResponseBody(), RegistrationMfaConfirmResponseDto.class);
+                logMfaConfirm(start, replayStatus, idempotencyKey, request.getRegistrationId(), "REPLAY", true);
+                return ResponseEntity.status(replayStatus)
+                        .body(cached);
             }
         }
 
@@ -346,7 +400,9 @@ public class RegistrationController {
         );
 
         upsertIdempotencyRecord(existing.orElseGet(IdempotencyRecord::new), idempotencyKey, requestHash, HttpStatus.OK.value(), toJson(response));
-        return ResponseEntity.ok(response);
+        ResponseEntity<RegistrationMfaConfirmResponseDto> responseEntity = ResponseEntity.ok(response);
+        logMfaConfirm(start, HttpStatus.OK, idempotencyKey, request.getRegistrationId(), "SUCCESS", false);
+        return responseEntity;
     }
 
     private void ensureSamePayload(IdempotencyRecord record, String requestHash) {
@@ -355,11 +411,109 @@ public class RegistrationController {
         }
     }
 
+    private void logSocialRegistration(Instant start,
+                                      HttpStatus status,
+                                      Provider provider,
+                                      String idempotencyKey,
+                                      String outcome,
+                                      boolean replay,
+                                      String tenantId) {
+        Duration duration = Duration.between(start, Instant.now());
+        StructuredLogBuilder.forLogger(log)
+                .event("registration.social." + provider.name().toLowerCase())
+                .targetService("auth-service")
+                .requestPath("/registration/social/" + provider.name().toLowerCase())
+                .httpMethod("POST")
+                .httpStatus(status != null ? status.value() : HttpStatus.OK.value())
+                .duration(duration)
+                .outcome(outcome)
+                .correlationId(correlationId())
+                .field("idempotencyKey", idempotencyKey)
+                .field("provider", provider.name())
+                .field("tenantId", tenantId)
+                .field("replay", replay)
+                .info(replay ? "Social registration replayed" : "Social registration executed");
+    }
+
+    private void logRegistrationVerify(Instant start,
+                                       HttpStatus status,
+                                       String idempotencyKey,
+                                       String registrationId,
+                                       String outcome,
+                                       boolean replay) {
+        Duration duration = Duration.between(start, Instant.now());
+        StructuredLogBuilder.forLogger(log)
+                .event("registration.verify")
+                .targetService("auth-service")
+                .requestPath("/registration/verify-email")
+                .httpMethod("POST")
+                .httpStatus(status != null ? status.value() : HttpStatus.OK.value())
+                .duration(duration)
+                .outcome(outcome)
+                .correlationId(correlationId())
+                .field("idempotencyKey", idempotencyKey)
+                .field("registrationId", registrationId)
+                .field("replay", replay)
+                .info(replay ? "Registration verify replayed" : "Registration verify executed");
+    }
+
+    private void logMfaEnroll(Instant start,
+                              HttpStatus status,
+                              String idempotencyKey,
+                              String registrationId,
+                              String outcome,
+                              boolean replay) {
+        Duration duration = Duration.between(start, Instant.now());
+        StructuredLogBuilder.forLogger(log)
+                .event("registration.mfa.enroll")
+                .targetService("auth-service")
+                .requestPath("/registration/mfa/totp/enroll")
+                .httpMethod("POST")
+                .httpStatus(status != null ? status.value() : HttpStatus.OK.value())
+                .duration(duration)
+                .outcome(outcome)
+                .correlationId(correlationId())
+                .field("idempotencyKey", idempotencyKey)
+                .field("registrationId", registrationId)
+                .field("replay", replay)
+                .info(replay ? "MFA enrollment replayed" : "MFA enrollment executed");
+    }
+
+    private void logMfaConfirm(Instant start,
+                               HttpStatus status,
+                               String idempotencyKey,
+                               String registrationId,
+                               String outcome,
+                               boolean replay) {
+        Duration duration = Duration.between(start, Instant.now());
+        StructuredLogBuilder.forLogger(log)
+                .event("registration.mfa.confirm")
+                .targetService("auth-service")
+                .requestPath("/registration/mfa/totp/confirm")
+                .httpMethod("POST")
+                .httpStatus(status != null ? status.value() : HttpStatus.OK.value())
+                .duration(duration)
+                .outcome(outcome)
+                .correlationId(correlationId())
+                .field("idempotencyKey", idempotencyKey)
+                .field("registrationId", registrationId)
+                .field("replay", replay)
+                .info(replay ? "MFA confirm replayed" : "MFA confirm executed");
+    }
+
     private String requestDigest(RegistrationStartRequestDto request) {
         return request.getTenantId() + "|" + request.getUserEmail() + "|" +
                 normalized(request.getCompanyPayload()) + "|" +
                 normalized(request.getLocationPayload()) + "|" +
                 normalized(request.getUserPayload());
+    }
+
+    private String socialRequestDigest(Provider provider, SocialRegistrationRequestDto request) {
+        return provider.name() + "|" + request.getTenantId() + "|" +
+                normalized(request.getCompanyPayload()) + "|" +
+                normalized(request.getLocationPayload()) + "|" +
+                normalized(request.getUserPayload()) + "|" +
+                request.getSocialToken();
     }
 
     private String normalized(JsonNode node) {
@@ -419,5 +573,27 @@ public class RegistrationController {
     private String correlationId() {
         String value = MDC.get(CorrelationIdFilter.MDC_KEY);
         return value == null ? "n/a" : value;
+    }
+
+    private void logRegistrationStart(Instant start,
+                                      HttpStatus status,
+                                      String idempotencyKey,
+                                      String outcome,
+                                      boolean replay,
+                                      String tenantId) {
+        Duration duration = Duration.between(start, Instant.now());
+        StructuredLogBuilder.forLogger(log)
+                .event("registration.start")
+                .targetService("auth-service")
+                .requestPath("/registration/start")
+                .httpMethod("POST")
+                .httpStatus(status.value())
+                .duration(duration)
+                .outcome(outcome)
+                .correlationId(correlationId())
+                .field("idempotencyKey", idempotencyKey)
+                .field("tenantId", tenantId)
+                .field("replay", replay)
+                .info(replay ? "Registration start replayed" : "Registration start executed");
     }
 }

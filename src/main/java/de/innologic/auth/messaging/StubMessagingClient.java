@@ -11,9 +11,9 @@ public class StubMessagingClient implements MessagingClient {
     private static final Logger log = LoggerFactory.getLogger(StubMessagingClient.class);
 
     @Override
-    public void sendPasswordReset(String recipient, String token) {
+    public void sendPasswordReset(String recipient, RecoveryChannel channel, String token) {
         // TODO Integrate with real e-mail/SMS provider.
-        log.info("[MessagingStub] Password reset token for {}: {}", recipient, token);
+        log.info("[MessagingStub] Password reset token for {} via {}: {}", recipient, channel, token);
     }
 
     @Override

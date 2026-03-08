@@ -46,6 +46,14 @@ public class JwtKeyService {
         }
     }
 
+    public RSAPublicKey getPublicKey() {
+        try {
+            return rsaKey.toRSAPublicKey();
+        } catch (JOSEException e) {
+            throw new IllegalStateException("Unable to extract RSA public key", e);
+        }
+    }
+
     private RSAKey generateDevRsaKey() {
         try {
             KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance("RSA");
